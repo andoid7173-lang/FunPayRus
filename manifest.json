@@ -1,0 +1,7 @@
+{
+  "name": "Пример плагина",
+  "version": "0.1.0",
+  "description": "Демонстрирует подключаемые команды",
+  "command": "hello",
+  "enabled": true
+}

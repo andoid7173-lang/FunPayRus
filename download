@@ -1,0 +1,25 @@
+# Secrets: never commit
+.env
+.env.*
+!.env.example
+*.secret
+*.pem
+*.key
+*.session
+bot.env
+
+# User and runtime data
+/data/
+*.sqlite
+*.sqlite3
+*.db
+*.log
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+.idea/
+.vscode/
+.DS_Store
