@@ -1,0 +1,74 @@
+"""Run Telegram admin bot with long polling."""
+from datetime import datetime, timezone
+import logging
+from pathlib import Path
+import signal
+import time
+
+from bot.commands import reply_for, callback_for, menu, plugin_menu
+from bot.config import Config
+from bot.plugins import PluginManager
+from bot.telegram_api import TelegramAPI, TelegramError
+
+LOG = logging.getLogger("funpayrus")
+RUNNING = True
+
+def stop(_signal, _frame):
+    global RUNNING
+    RUNNING = False
+
+def main():
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    try:
+        config = Config.load()
+    except ValueError as exc:
+        LOG.error("Ошибка настроек: %s", exc)
+        return 2
+    plugins = PluginManager(Path(__file__).resolve().parent.parent / "plugins",
+                            Path("/var/lib/funpayrus/plugins"),
+                            Path("/var/lib/funpayrus/plugin-state.json"))
+    api = TelegramAPI(config.bot_token)
+    try:
+        me = api.call("getMe")
+    except TelegramError as exc:
+        LOG.error("Не удалось запустить бота: %s", exc)
+        return 1
+    LOG.info("FunPay Rus стартовал (Telegram bot id %s)", me.get("id"))
+    started_at = datetime.now(timezone.utc)
+    offset = None
+    while RUNNING:
+        try:
+            for update in api.updates(offset):
+                uid = update.get("update_id")
+                if isinstance(uid, int):
+                    offset = uid + 1
+                message = update.get("message") or {}
+                answer = reply_for(message, config.admin_id, plugins, started_at)
+                if answer:
+                    command = (message.get("text") or "").split(maxsplit=1)[0].split("@")[0].lower()
+                    buttons = plugin_menu(plugins) if command == "/plugins" else menu()
+                    api.send(config.admin_id, answer, buttons)
+                callback = update.get("callback_query") or {}
+                if callback:
+                    response = callback_for(callback, config.admin_id, plugins, started_at)
+                    if response:
+                        text, buttons = response
+                        try:
+                            api.edit(config.admin_id, callback["message"]["message_id"], text, buttons)
+                        except (KeyError, TelegramError):
+                            api.send(config.admin_id, text, buttons)
+                    if isinstance(callback.get("id"), str):
+                        api.acknowledge(callback["id"])
+        except TelegramError as exc:
+            LOG.warning("Telegram API: %s; повтор через 5 секунд", exc)
+            time.sleep(5)
+        except Exception as exc:
+            LOG.error("Ошибка обработки события: %s", type(exc).__name__)
+            time.sleep(2)
+    LOG.info("FunPay Rus остановлен")
+    return 0
+
+if __name__ == "__main__":
+    raise SystemExit(main())
