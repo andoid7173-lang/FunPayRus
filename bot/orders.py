@@ -175,6 +175,17 @@ class OrderStore:
                            'price TEXT NOT NULL, updated_at INTEGER NOT NULL)')
                 db.execute('CREATE TABLE IF NOT EXISTS metadata ('
                            'name TEXT PRIMARY KEY, value TEXT NOT NULL)')
+                # Durable at-least-once Telegram delivery queue. Historical
+                # events are queued atomically with the order snapshot.
+                db.execute('CREATE TABLE IF NOT EXISTS delivery_outbox ('
+                           'id INTEGER PRIMARY KEY AUTOINCREMENT, '
+                           'recipient INTEGER NOT NULL, order_id TEXT NOT NULL, '
+                           'kind TEXT NOT NULL, previous_status TEXT, '
+                           'status TEXT NOT NULL, description TEXT NOT NULL, '
+                           'buyer TEXT NOT NULL, price TEXT NOT NULL, '
+                           'created_at INTEGER NOT NULL, delivered_at INTEGER)')
+                db.execute('CREATE INDEX IF NOT EXISTS delivery_outbox_pending '
+                           'ON delivery_outbox(delivered_at, id)')
         except (OSError, sqlite3.Error) as exc:
             raise OrderMonitorError('Не удалось открыть хранилище заказов') from None
 
@@ -190,10 +201,16 @@ class OrderStore:
         finally:
             db.close()
 
-    def record(self, orders):
-        """Returns new PAID orders only; first successful snapshot is silent."""
+    def record(self, orders, recipients=()):
+        """Store a snapshot and queue alert events in the SAME transaction.
+
+        First successful snapshot is silent, as in v0.3.2. New paid sales and
+        later closed/refunded transitions generate events. The return value
+        remains a list of newly paid orders for existing callers.
+        """
         if not isinstance(orders, list):
             raise OrderMonitorError('Некорректный список заказов')
+        recipients = sorted({uid for uid in recipients if type(uid) is int and uid > 0})
         now = int(time.time())
         notifications = []
         try:
@@ -205,21 +222,95 @@ class OrderStore:
                         continue
                     if order.status not in ('paid', 'closed', 'refunded'):
                         continue
-                    old = db.execute('SELECT status FROM orders WHERE id=?', (order.order_id,)).fetchone()
-                    if not first and order.status == 'paid' and (old is None or old[0] != 'paid'):
-                        notifications.append(order)
+                    previous = db.execute(
+                        'SELECT status FROM orders WHERE id=?', (order.order_id,)
+                    ).fetchone()
+                    old_status = previous[0] if previous else None
+                    kind = None
+                    if not first:
+                        if order.status == 'paid' and old_status != 'paid':
+                            notifications.append(order)
+                            kind = 'paid'
+                        elif old_status is not None and old_status != order.status:
+                            kind = 'status'
+                    description = _clean(order.description, 200)
+                    buyer = _clean(order.buyer, 80)
+                    price = _clean(order.price, 80)
                     db.execute('INSERT INTO orders(id,status,description,buyer,price,updated_at) '
                                'VALUES (?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET '
                                'status=excluded.status, description=excluded.description, '
                                'buyer=excluded.buyer, price=excluded.price, updated_at=excluded.updated_at',
-                               (order.order_id, order.status, _clean(order.description, 200),
-                                _clean(order.buyer, 80), _clean(order.price, 80), now))
+                               (order.order_id, order.status, description, buyer, price, now))
+                    if kind:
+                        for uid in recipients:
+                            db.execute(
+                                'INSERT INTO delivery_outbox(recipient,order_id,kind,'
+                                'previous_status,status,description,buyer,price,created_at) '
+                                'VALUES (?,?,?,?,?,?,?,?,?)',
+                                (uid, order.order_id, kind, old_status,
+                                 order.status, description, buyer, price, now))
                 db.execute("INSERT OR REPLACE INTO metadata(name,value) VALUES('initialized','1')")
                 db.execute("INSERT OR REPLACE INTO metadata(name,value) VALUES('last_poll',?)", (str(now),))
             self.last_error = None
             return notifications
-        except sqlite3.Error:
+        except (sqlite3.Error, OSError):
             raise OrderMonitorError('Не удалось сохранить результаты мониторинга') from None
+
+    def pending_deliveries(self, limit=30):
+        """Return (event_id, recipient, kind, previous_status, Order) tuples."""
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise ValueError('Invalid delivery limit')
+        try:
+            with self._connect() as db:
+                rows = db.execute(
+                    'SELECT id,recipient,kind,previous_status,order_id,status,'
+                    'description,buyer,price FROM delivery_outbox '
+                    'WHERE delivered_at IS NULL ORDER BY id ASC LIMIT ?', (limit,)
+                ).fetchall()
+            return [(r[0], r[1], r[2], r[3], Order(*r[4:])) for r in rows]
+        except (sqlite3.Error, OSError):
+            raise OrderMonitorError('Не удалось прочитать очередь уведомлений') from None
+
+    def mark_delivered(self, event_id):
+        try:
+            with self._connect() as db:
+                db.execute('UPDATE delivery_outbox SET delivered_at=? '
+                           'WHERE id=? AND delivered_at IS NULL',
+                           (int(time.time()), event_id))
+        except (sqlite3.Error, OSError):
+            raise OrderMonitorError('Не удалось отметить доставку уведомления') from None
+
+    def find(self, query, limit=7):
+        """Search only saved orders, using bound parameters (no wildcard injection)."""
+        if not isinstance(query, str) or not 1 <= len(query.strip()) <= 80:
+            return []
+        q = query.strip()
+        try:
+            with self._connect() as db:
+                rows = db.execute(
+                    'SELECT id,status,description,buyer,price FROM orders '
+                    'WHERE instr(lower(id),lower(?))>0 OR '
+                    'instr(lower(buyer),lower(?))>0 OR '
+                    'instr(lower(description),lower(?))>0 '
+                    'ORDER BY updated_at DESC, id DESC LIMIT ?',
+                    (q, q, q, min(7, max(1, limit)))
+                ).fetchall()
+            return [Order(*r) for r in rows]
+        except (sqlite3.Error, OSError):
+            raise OrderMonitorError('Не удалось выполнить поиск заказов') from None
+
+    def get_order(self, order_id):
+        if type(order_id) is not str or not _ORDER_ID.fullmatch(order_id):
+            return None
+        try:
+            with self._connect() as db:
+                row = db.execute(
+                    'SELECT id,status,description,buyer,price FROM orders WHERE id=?',
+                    (order_id,)
+                ).fetchone()
+            return Order(*row) if row else None
+        except (sqlite3.Error, OSError):
+            raise OrderMonitorError('Не удалось прочитать заказ') from None
 
     def summary(self):
         try:

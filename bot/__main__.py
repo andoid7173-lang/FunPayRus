@@ -26,41 +26,120 @@ def stop(_signal, _frame):
 
 
 
-def poll_orders_once(store, settings, api, key=None, fetcher=fetch_sales):
-    """One opt-in read-only polling cycle. Inject fetcher for offline tests."""
-    if not settings.monitor_enabled():
+
+class PollGuard:
+    """Serialize periodic and manual requests and throttle forced refreshes."""
+
+    def __init__(self, minimum_interval=20):
+        self.lock = threading.Lock()
+        self.last_started = 0.0
+        self.minimum_interval = minimum_interval
+
+    def enter(self):
+        if not self.lock.acquire(blocking=False):
+            return False
+        now = time.monotonic()
+        if now - self.last_started < self.minimum_interval:
+            self.lock.release()
+            return False
+        self.last_started = now
+        return True
+
+    def leave(self):
+        self.lock.release()
+
+
+def flush_deliveries(store, settings, api, limit=30):
+    """Durably retry unsent Telegram notifications; never leak to revoked roles.
+
+    At-least-once delivery: a process crash between Telegram success and
+    local acknowledgement may produce a duplicate, but never silently
+    discards the notification before Telegram accepts it.
+    """
+    sent = 0
+    try:
+        entries = store.pending_deliveries(limit=limit)
+    except OrderMonitorError as exc:
+        LOG.warning('Очередь уведомлений: %s', exc)
         return 0
-    key = os.environ.get('FUNPAY_GOLDEN_KEY') if key is None else key
-    if not key:
-        store.last_error = 'Golden Key отсутствует. Настрой его только на VPS.'
+    for event_id, uid, kind, previous_status, order in entries:
+        if settings.role(uid) not in ('owner', 'admin') or not settings.order_alert_enabled(uid):
+            store.mark_delivered(event_id)
+            continue
+        button = order_button(order.order_id)
+        markup = {'inline_keyboard': [[button]]} if button else None
+        if kind == 'paid':
+            title = '🛒 Новый оплаченный заказ'
+        else:
+            old = previous_status or 'неизвестно'
+            title = f'🔄 Статус заказа изменился: {old} → {order.status}'
+        try:
+            api.send(uid, title + '\\n\\n' + describe_order(order), markup)
+        except TelegramError:
+            LOG.warning('Уведомление о заказе не доставлено; повторим позднее')
+            continue
+        store.mark_delivered(event_id)
+        sent += 1
+    return sent
+
+
+def poll_orders_once(store, settings, api, key=None, fetcher=fetch_sales, guard=None):
+    """One opt-in read-only polling cycle; sends durably queued events."""
+    if not settings.monitor_enabled():
+        flush_deliveries(store, settings, api)
+        return 0
+    if guard is not None and not guard.enter():
+        flush_deliveries(store, settings, api)
         return 0
     try:
-        updates = store.record(fetcher(key, user_agent=os.getenv('FUNPAY_USER_AGENT')))
-    except OrderMonitorError as exc:
-        store.last_error = str(exc)
-        return 0
-    for order in updates:
-        for user_id in settings.order_alert_recipients():
-            try:
-                button = order_button(order.order_id)
-                markup = {'inline_keyboard': [[button]]} if button else None
-                api.send(user_id, '🛒 Новый оплаченный заказ (только уведомление)\n\n'
-                         + describe_order(order), markup)
-            except TelegramError:
-                LOG.warning('Уведомление о заказе не доставлено; проверь Telegram')
-    return len(updates)
+        key = os.environ.get('FUNPAY_GOLDEN_KEY') if key is None else key
+        if not key:
+            store.last_error = 'Golden Key отсутствует. Настрой его только на VPS.'
+            return 0
+        try:
+            updates = store.record(
+                fetcher(key, user_agent=os.getenv('FUNPAY_USER_AGENT')),
+                recipients=settings.order_alert_recipients()
+            )
+        except OrderMonitorError as exc:
+            store.last_error = str(exc)
+            return 0
+        return len(updates)
+    finally:
+        if guard is not None:
+            guard.leave()
+        flush_deliveries(store, settings, api)
 
 
-def monitor_orders(store, settings, api, stop_event):
-    """Daemon poller; does not write to FunPay or execute buyer actions."""
+def monitor_orders(store, settings, api, stop_event, guard=None):
+    """30-second opt-in polling with backoff; alert on repeated failures."""
+    failures = 0
+    warned = False
     while not stop_event.is_set():
         if not settings.monitor_enabled():
+            flush_deliveries(store, settings, api)
             stop_event.wait(4)
             continue
-        poll_orders_once(store, settings, api)
+        poll_orders_once(store, settings, api, guard=guard)
         if store.last_error:
+            failures += 1
             LOG.warning('Мониторинг заказов: %s', store.last_error)
-        delay = 300 if store.last_error and 'частоту' in store.last_error else 90
+            if failures >= 3 and not warned:
+                try:
+                    api.send(settings.owner_id, '⚠️ Мониторинг FunPay: три проверки подряд завершились ошибкой. '
+                             'Открой /orders для диагностики. Покупателям ничего не отправлялось.')
+                    warned = True
+                except TelegramError:
+                    LOG.warning('Предупреждение о сбое FunPay не доставлено')
+        else:
+            if warned:
+                try:
+                    api.send(settings.owner_id, '✅ Мониторинг FunPay снова получает данные.')
+                except TelegramError:
+                    pass
+            failures = 0
+            warned = False
+        delay = 300 if store.last_error and 'частоту' in store.last_error else 30
         stop_event.wait(delay)
 
 
@@ -103,7 +182,10 @@ def main():
         except TelegramError:
             LOG.warning('Не удалось доставить уведомление об автозапуске (chat id скрыт)')
     stop_event = threading.Event()
-    threading.Thread(target=monitor_orders, args=(orders, settings, api, stop_event),
+    poll_guard = PollGuard()
+    def poll_now():
+        return poll_orders_once(orders, settings, api, guard=poll_guard)
+    threading.Thread(target=monitor_orders, args=(orders, settings, api, stop_event, poll_guard),
                      name='funpay-orders-readonly', daemon=True).start()
     started_at = datetime.now(timezone.utc)
     while RUNNING:
@@ -118,7 +200,7 @@ def main():
                     return 2
                 message = update.get('message') or {}
                 answer = reply_for(message, config.admin_id, plugins, started_at,
-                                   settings=settings, orders=orders)
+                                   settings=settings, orders=orders, poll_now=poll_now)
                 if answer:
                     chat_id = message['from']['id']
                     buttons = keyboard_for_command(message.get('text', ''), plugins,
@@ -127,7 +209,7 @@ def main():
                 callback = update.get('callback_query') or {}
                 if callback:
                     response = callback_for(callback, config.admin_id, plugins, started_at,
-                                            settings=settings, orders=orders)
+                                            settings=settings, orders=orders, poll_now=poll_now)
                     if response:
                         text, buttons = response
                         chat_id = callback['from']['id']
