@@ -274,7 +274,7 @@ def keyboard_for_command(text, plugins, settings=None, user_id=None, owner_id=No
 
 
 def callback_for(callback, admin_id, plugins, started_at,
-                 funpay_status=status_from_environment, settings=None, orders=None):
+                 funpay_status=status_from_environment, settings=None, orders=None, poll_now=None):
     check = {'from': callback.get('from'), 'chat': (callback.get('message') or {}).get('chat')}
     if not allowed(check, admin_id, settings):
         return None
