@@ -233,6 +233,25 @@ class OrderStore:
             raise OrderMonitorError('Не удалось прочитать историю заказов') from None
 
 
+def order_url(order_id):
+    """Return a FunPay order permalink for a strictly validated order ID.
+
+    Order IDs come from untrusted HTML. Never echo the site's href attribute
+    or build an arbitrary redirect from it. No credentials appear in the URL.
+    """
+    if type(order_id) is not str or not _ORDER_ID.fullmatch(order_id):
+        return None
+    return 'https://funpay.com/orders/' + order_id + '/'
+
+
+def order_button(order_id):
+    """One safe Telegram URL button, or None for malformed order IDs."""
+    url = order_url(order_id)
+    if url is None:
+        return None
+    return {'text': '🔗 Открыть заказ #' + order_id[:32], 'url': url}
+
+
 def describe_order(order):
     status = {'paid': '💰 Оплачен', 'closed': '✅ Закрыт',
               'refunded': '↩️ Возврат'}.get(order.status, '❔')

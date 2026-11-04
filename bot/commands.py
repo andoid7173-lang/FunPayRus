@@ -6,7 +6,7 @@ from bot import __version__
 from bot.diagnostics import demo_screen, report, setup_summary
 from bot.funpay_probe import status_from_environment
 from bot.settings import SettingsError
-from bot.orders import OrderMonitorError
+from bot.orders import OrderMonitorError, order_button
 
 _ID = re.compile(r'^[1-9][0-9]{0,18}$')
 
@@ -56,12 +56,22 @@ def alerts_menu(settings, user_id):
     return {'inline_keyboard': rows}
 
 
-def orders_menu(settings, uid):
+def orders_menu(settings, uid, orders=None):
     rows = []
     if settings and settings.role(uid) == 'owner':
         enabled = settings.monitor_enabled()
         rows.append([{'text': ('⏹ Выключить' if enabled else '▶️ Включить') + ' мониторинг',
                       'callback_data': 'o:toggle'}])
+    # Order links come only from validated IDs stored by the read-only monitor.
+    if orders is not None and settings and settings.role(uid) in ('owner', 'admin'):
+        try:
+            _count, _last, items = orders.summary()
+            for item in items[:5]:
+                button = order_button(item.order_id)
+                if button is not None:
+                    rows.append([button])
+        except OrderMonitorError:
+            pass  # Keep the section usable if SQLite is temporarily unavailable.
     rows.append([{'text': '🔄 Обновить экран', 'callback_data': 'm:orders'}])
     rows.append([{'text': '⬅️ Назад', 'callback_data': 'm:home'}])
     return {'inline_keyboard': rows}
@@ -220,14 +230,14 @@ def reply_for(message, admin_id, plugins, started_at,
     return plugins.execute(command, args) if role == 'owner' else None
 
 
-def keyboard_for_command(text, plugins, settings=None, user_id=None, owner_id=None):
+def keyboard_for_command(text, plugins, settings=None, user_id=None, owner_id=None, orders=None):
     command = text.strip().split(maxsplit=1)[0].split('@')[0].lower() if text and text.strip() else ''
     if command == '/plugins' and role_for(user_id, owner_id, settings) == 'owner':
         return plugin_menu(plugins)
     if command == '/notifications':
         return alerts_menu(settings, user_id)
     if command == '/orders':
-        return orders_menu(settings, user_id)
+        return orders_menu(settings, user_id, orders)
     return menu(role_for(user_id, owner_id, settings))
 
 
@@ -249,15 +259,15 @@ def callback_for(callback, admin_id, plugins, started_at,
         command = sections[data]
         output = reply_for({**check, 'text': command}, admin_id, plugins, started_at,
                            funpay_status=funpay_status, settings=settings, orders=orders)
-        return output, keyboard_for_command(command, plugins, settings, uid, admin_id)
+        return output, keyboard_for_command(command, plugins, settings, uid, admin_id, orders)
     if data == 'o:toggle':
         if role != 'owner' or settings is None:
             return '🔒 Только владелец включает мониторинг.', menu(role)
         try:
             settings.set_monitor(not settings.monitor_enabled())
         except SettingsError:
-            return '❌ Не удалось сохранить режим мониторинга.', orders_menu(settings, uid)
-        return orders_screen(settings, orders), orders_menu(settings, uid)
+            return '❌ Не удалось сохранить режим мониторинга.', orders_menu(settings, uid, orders)
+        return orders_screen(settings, orders), orders_menu(settings, uid, orders)
     if data == 'a:orders':
         if role not in ('owner', 'admin') or settings is None:
             return '🔒 Уведомления о заказах недоступны.', menu(role)

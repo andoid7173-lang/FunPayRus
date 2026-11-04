@@ -12,7 +12,7 @@ from bot.commands import reply_for, callback_for, keyboard_for_command
 from bot.config import Config
 from bot.plugins import PluginManager, PluginStateError
 from bot.settings import Settings, SettingsError
-from bot.orders import OrderStore, OrderMonitorError, fetch_sales, describe_order
+from bot.orders import OrderStore, OrderMonitorError, fetch_sales, describe_order, order_button
 from bot.telegram_api import TelegramAPI, TelegramError
 
 LOG = logging.getLogger('funpayrust')
@@ -42,8 +42,10 @@ def poll_orders_once(store, settings, api, key=None, fetcher=fetch_sales):
     for order in updates:
         for user_id in settings.order_alert_recipients():
             try:
+                button = order_button(order.order_id)
+                markup = {'inline_keyboard': [[button]]} if button else None
                 api.send(user_id, '🛒 Новый оплаченный заказ (только уведомление)\n\n'
-                         + describe_order(order))
+                         + describe_order(order), markup)
             except TelegramError:
                 LOG.warning('Уведомление о заказе не доставлено; проверь Telegram')
     return len(updates)
@@ -120,7 +122,7 @@ def main():
                 if answer:
                     chat_id = message['from']['id']
                     buttons = keyboard_for_command(message.get('text', ''), plugins,
-                                                   settings, chat_id, config.admin_id)
+                                                   settings, chat_id, config.admin_id, orders)
                     api.send(chat_id, answer, buttons)
                 callback = update.get('callback_query') or {}
                 if callback:
