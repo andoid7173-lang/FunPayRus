@@ -2,23 +2,33 @@
 import json
 from urllib import request, error
 
+
 class TelegramError(Exception):
     pass
+
 
 class TelegramAPI:
     def __init__(self, token):
         self._token = token
 
     def call(self, method, payload=None):
+        # Only internal constant method names are intended; reject injection early.
+        if method not in {"getMe", "sendMessage", "editMessageText", "answerCallbackQuery", "getUpdates"}:
+            raise TelegramError("Недопустимый метод Telegram API")
         url = "https://api.telegram.org/bot" + self._token + "/" + method
-        req = request.Request(url, data=json.dumps(payload or {}, ensure_ascii=False).encode("utf-8"),
-                              headers={"Content-Type": "application/json"}, method="POST")
+        req = request.Request(
+            url, data=json.dumps(payload or {}, ensure_ascii=False).encode("utf-8"),
+            headers={"Content-Type": "application/json"}, method="POST"
+        )
         try:
             with request.urlopen(req, timeout=40) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
+                result = resp.read(2 * 1024 * 1024 + 1)
+                if len(result) > 2 * 1024 * 1024:
+                    raise TelegramError("Слишком большой ответ Telegram API")
+                data = json.loads(result.decode("utf-8"))
         except error.HTTPError as exc:
             raise TelegramError(f"Telegram API HTTP {exc.code}") from None
-        except (error.URLError, TimeoutError):
+        except (error.URLError, TimeoutError, OSError):
             raise TelegramError("Нет соединения с Telegram API") from None
         except (UnicodeError, ValueError):
             raise TelegramError("Некорректный ответ Telegram API") from None
