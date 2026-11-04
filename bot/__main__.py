@@ -4,6 +4,7 @@ import logging
 import os
 from pathlib import Path
 import signal
+import threading
 import time
 
 from bot.checkpoint import CheckpointError, UpdateCheckpoint
@@ -11,6 +12,7 @@ from bot.commands import reply_for, callback_for, keyboard_for_command
 from bot.config import Config
 from bot.plugins import PluginManager, PluginStateError
 from bot.settings import Settings, SettingsError
+from bot.orders import OrderStore, OrderMonitorError, fetch_sales, describe_order
 from bot.telegram_api import TelegramAPI, TelegramError
 
 LOG = logging.getLogger('funpayrust')
@@ -23,6 +25,43 @@ def stop(_signal, _frame):
     RUNNING = False
 
 
+
+def poll_orders_once(store, settings, api, key=None, fetcher=fetch_sales):
+    """One opt-in read-only polling cycle. Inject fetcher for offline tests."""
+    if not settings.monitor_enabled():
+        return 0
+    key = os.environ.get('FUNPAY_GOLDEN_KEY') if key is None else key
+    if not key:
+        store.last_error = 'Golden Key отсутствует. Настрой его только на VPS.'
+        return 0
+    try:
+        updates = store.record(fetcher(key, user_agent=os.getenv('FUNPAY_USER_AGENT')))
+    except OrderMonitorError as exc:
+        store.last_error = str(exc)
+        return 0
+    for order in updates:
+        for user_id in settings.order_alert_recipients():
+            try:
+                api.send(user_id, '🛒 Новый оплаченный заказ (только уведомление)\n\n'
+                         + describe_order(order))
+            except TelegramError:
+                LOG.warning('Уведомление о заказе не доставлено; проверь Telegram')
+    return len(updates)
+
+
+def monitor_orders(store, settings, api, stop_event):
+    """Daemon poller; does not write to FunPay or execute buyer actions."""
+    while not stop_event.is_set():
+        if not settings.monitor_enabled():
+            stop_event.wait(4)
+            continue
+        poll_orders_once(store, settings, api)
+        if store.last_error:
+            LOG.warning('Мониторинг заказов: %s', store.last_error)
+        delay = 300 if store.last_error and 'частоту' in store.last_error else 90
+        stop_event.wait(delay)
+
+
 def main():
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
     signal.signal(signal.SIGTERM, stop)
@@ -31,10 +70,11 @@ def main():
         config = Config.load()
         checkpoint = UpdateCheckpoint(STATE_DIR / 'telegram-offset.json')
         settings = Settings(config.admin_id, STATE_DIR / 'settings.json')
+        orders = OrderStore(STATE_DIR / 'orders.sqlite3')
     except ValueError as exc:
         LOG.error('Ошибка настроек: %s', exc)
         return 2
-    except (CheckpointError, SettingsError) as exc:
+    except (CheckpointError, SettingsError, OrderMonitorError) as exc:
         LOG.error('Ошибка безопасного хранения: %s', exc)
         return 2
 
@@ -60,6 +100,9 @@ def main():
             api.send(uid, '✅ FunPay Rust запущен. Служба работает.')
         except TelegramError:
             LOG.warning('Не удалось доставить уведомление об автозапуске (chat id скрыт)')
+    stop_event = threading.Event()
+    threading.Thread(target=monitor_orders, args=(orders, settings, api, stop_event),
+                     name='funpay-orders-readonly', daemon=True).start()
     started_at = datetime.now(timezone.utc)
     while RUNNING:
         try:
@@ -73,7 +116,7 @@ def main():
                     return 2
                 message = update.get('message') or {}
                 answer = reply_for(message, config.admin_id, plugins, started_at,
-                                   settings=settings)
+                                   settings=settings, orders=orders)
                 if answer:
                     chat_id = message['from']['id']
                     buttons = keyboard_for_command(message.get('text', ''), plugins,
@@ -82,7 +125,7 @@ def main():
                 callback = update.get('callback_query') or {}
                 if callback:
                     response = callback_for(callback, config.admin_id, plugins, started_at,
-                                            settings=settings)
+                                            settings=settings, orders=orders)
                     if response:
                         text, buttons = response
                         chat_id = callback['from']['id']
@@ -98,6 +141,7 @@ def main():
         except Exception as exc:
             LOG.error('Ошибка обработки события: %s', type(exc).__name__)
             time.sleep(2)
+    stop_event.set()
     LOG.info('FunPay Rust остановлен')
     return 0
 

@@ -6,6 +6,7 @@ from bot import __version__
 from bot.diagnostics import demo_screen, report, setup_summary
 from bot.funpay_probe import status_from_environment
 from bot.settings import SettingsError
+from bot.orders import OrderMonitorError
 
 _ID = re.compile(r'^[1-9][0-9]{0,18}$')
 
@@ -33,6 +34,8 @@ def menu(role='owner'):
         [{'text': '🔔 Уведомления', 'callback_data': 'm:notifications'},
          {'text': '🧭 Настройка', 'callback_data': 'm:setup'}],
     ]
+    if role in ('owner', 'admin'):
+        rows.append([{'text': '📦 Заказы (тест)', 'callback_data': 'm:orders'}])
     if role == 'owner':
         rows.append([{'text': '👥 Администраторы', 'callback_data': 'm:admins'},
                      {'text': '🧩 Плагины', 'callback_data': 'm:plugins'}])
@@ -43,11 +46,51 @@ def menu(role='owner'):
 
 def alerts_menu(settings, user_id):
     active = bool(settings and settings.startup_enabled(user_id))
-    return {'inline_keyboard': [
-        [{'text': ('✅ ' if active else '⚪ ') + 'Уведомлять о запуске бота',
-          'callback_data': 'a:startup'}],
-        [{'text': '⬅️ Главное меню', 'callback_data': 'm:home'}]
-    ]}
+    rows = [[{'text': ('✅ ' if active else '⚪ ') + 'Уведомлять о запуске бота',
+              'callback_data': 'a:startup'}]]
+    if settings and settings.role(user_id) in ('owner', 'admin'):
+        orders = settings.order_alert_enabled(user_id)
+        rows.append([{'text': ('✅ ' if orders else '⚪ ') + 'Новые оплаченные заказы',
+                      'callback_data': 'a:orders'}])
+    rows.append([{'text': '⬅️ Главное меню', 'callback_data': 'm:home'}])
+    return {'inline_keyboard': rows}
+
+
+def orders_menu(settings, uid):
+    rows = []
+    if settings and settings.role(uid) == 'owner':
+        enabled = settings.monitor_enabled()
+        rows.append([{'text': ('⏹ Выключить' if enabled else '▶️ Включить') + ' мониторинг',
+                      'callback_data': 'o:toggle'}])
+    rows.append([{'text': '🔄 Обновить экран', 'callback_data': 'm:orders'}])
+    rows.append([{'text': '⬅️ Назад', 'callback_data': 'm:home'}])
+    return {'inline_keyboard': rows}
+
+
+def orders_screen(settings, orders):
+    if not settings or orders is None:
+        return '📦 Хранилище заказов не настроено.'
+    enabled = settings.monitor_enabled()
+    result = ['📦 Заказы FunPay — тест только на чтение',
+              'Мониторинг: ' + ('✅ включён' if enabled else '⏸ выключен'),
+              'Первый успешный опрос сохраняет историю без уведомлений.',
+              'Опрос: примерно каждые 90 секунд, только первая страница продаж.']
+    if orders.last_error:
+        result.append('⚠️ Последняя ошибка: ' + orders.last_error)
+    try:
+        count, last, items = orders.summary()
+        result.append(f'Сохранено заказов: {count}')
+        result.append('Последняя проверка: ' +
+                      (datetime.fromtimestamp(last, timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
+                       if last else 'ещё не проводилась'))
+        for order in items[:5]:
+            result.append(f'#{order.order_id}: {order.status} — {order.description[:65]}')
+    except OrderMonitorError:
+        result.append('⚠️ Не удалось прочитать историю заказов.')
+    result.append('Для владельца: /orders on или /orders off.\n'
+                  'Уведомления включаются отдельно в 🔔 Уведомления.\n'
+                  'Никаких сообщений покупателям и автовыдачи.')
+    return '\n'.join(result)[:3800]
 
 
 def plugin_menu(plugins):
@@ -83,7 +126,7 @@ def notifications_text(settings, uid):
     active = bool(settings and settings.startup_enabled(uid))
     return ('🔔 Центр уведомлений\n\n'
             f'Уведомление о запуске бота: {"включено" if active else "выключено"}\n'
-            'Уведомления о заказах: ещё не реализованы.\n'
+            f'Уведомления о заказах: {"включены" if settings and settings.order_alert_enabled(uid) else "выключены"}.\n'
             'Внешняя проверка доступности VPS: ещё не подключена.\n\n'
             'Настройки применяются сразу, без перезапуска.')
 
@@ -114,7 +157,7 @@ def _remove_admin(args, settings):
 
 
 def reply_for(message, admin_id, plugins, started_at,
-              funpay_status=status_from_environment, settings=None):
+              funpay_status=status_from_environment, settings=None, orders=None):
     if not allowed(message, admin_id, settings):
         return None
     text = message.get('text')
@@ -132,8 +175,9 @@ def reply_for(message, admin_id, plugins, started_at,
                 '/status — состояние\n/diagnostics — диагностика VPS\n'
                 '/notifications — центр уведомлений\n/demo — демо-режим\n'
                 '/setup — мастер настройки\n/funpay — тест соединения\n'
+                + ('/orders — мониторинг продаж (только чтение)\n' if role in ('owner', 'admin') else '')
                 + ('/admins — управление доступом\n/plugins — плагины\n' if role == 'owner' else '')
-                + '\n⚠️ Заказы и автовыдача ещё не включены.')
+                + '\n⚠️ Автовыдача и отправка сообщений покупателям отключены.')
     if command == 'status':
         seconds = max(0, int((datetime.now(timezone.utc) - started_at).total_seconds()))
         return (f'✅ FunPay Rust v{__version__} работает\n'
@@ -152,6 +196,19 @@ def reply_for(message, admin_id, plugins, started_at,
         return notifications_text(settings, uid)
     if command == 'funpay':
         return funpay_status() if role in ('owner', 'admin') else '🔒 Проверка FunPay доступна администраторам.'
+    if command == 'orders':
+        if role not in ('owner', 'admin'):
+            return '🔒 Заказы доступны только администраторам.'
+        if args.strip() in ('on', 'off'):
+            if role != 'owner' or settings is None:
+                return '🔒 Только владелец включает мониторинг.'
+            try:
+                settings.set_monitor(args.strip() == 'on')
+            except SettingsError:
+                return '❌ Не удалось сохранить режим мониторинга.'
+        elif args.strip():
+            return 'Используй: /orders [on|off]'
+        return orders_screen(settings, orders)
     if command == 'admins':
         return admins_text(settings) if role == 'owner' else '🔒 Только владелец управляет доступом.'
     if command == 'addadmin':
@@ -169,11 +226,13 @@ def keyboard_for_command(text, plugins, settings=None, user_id=None, owner_id=No
         return plugin_menu(plugins)
     if command == '/notifications':
         return alerts_menu(settings, user_id)
+    if command == '/orders':
+        return orders_menu(settings, user_id)
     return menu(role_for(user_id, owner_id, settings))
 
 
 def callback_for(callback, admin_id, plugins, started_at,
-                 funpay_status=status_from_environment, settings=None):
+                 funpay_status=status_from_environment, settings=None, orders=None):
     check = {'from': callback.get('from'), 'chat': (callback.get('message') or {}).get('chat')}
     if not allowed(check, admin_id, settings):
         return None
@@ -184,12 +243,29 @@ def callback_for(callback, admin_id, plugins, started_at,
                 'm:ping': '/ping', 'm:funpay': '/funpay',
                 'm:plugins': '/plugins', 'm:diagnostics': '/diagnostics',
                 'm:setup': '/setup', 'm:demo': '/demo',
-                'm:notifications': '/notifications', 'm:admins': '/admins'}
+                'm:notifications': '/notifications', 'm:admins': '/admins',
+                'm:orders': '/orders'}
     if data in sections:
         command = sections[data]
         output = reply_for({**check, 'text': command}, admin_id, plugins, started_at,
-                           funpay_status=funpay_status, settings=settings)
+                           funpay_status=funpay_status, settings=settings, orders=orders)
         return output, keyboard_for_command(command, plugins, settings, uid, admin_id)
+    if data == 'o:toggle':
+        if role != 'owner' or settings is None:
+            return '🔒 Только владелец включает мониторинг.', menu(role)
+        try:
+            settings.set_monitor(not settings.monitor_enabled())
+        except SettingsError:
+            return '❌ Не удалось сохранить режим мониторинга.', orders_menu(settings, uid)
+        return orders_screen(settings, orders), orders_menu(settings, uid)
+    if data == 'a:orders':
+        if role not in ('owner', 'admin') or settings is None:
+            return '🔒 Уведомления о заказах недоступны.', menu(role)
+        try:
+            settings.toggle_order_alert(uid)
+        except SettingsError:
+            return '❌ Не удалось сохранить уведомления.', alerts_menu(settings, uid)
+        return notifications_text(settings, uid), alerts_menu(settings, uid)
     if data == 'a:startup':
         try:
             if not settings or not settings.toggle_startup(uid):

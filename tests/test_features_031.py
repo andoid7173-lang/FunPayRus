@@ -100,7 +100,8 @@ class TestSecurityAndRoles(unittest.TestCase):
     def test_no_auto_enable_and_file_permissions(self):
         self.settings.add(200)
         obj = json.loads(self.file.read_text(encoding='utf8'))
-        self.assertEqual(obj, {'admins': {'200': 'viewer'}, 'startup_alerts': []})
+        self.assertEqual(obj, {'admins': {'200': 'viewer'}, 'startup_alerts': [],
+                               'order_alerts': [], 'order_monitor': False})
         if os.name == 'posix':
             self.assertEqual(self.file.stat().st_mode & 0o777, 0o600)
 
