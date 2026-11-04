@@ -1,93 +1,209 @@
-"""Private admin-only menu and callback handling."""
+"""Private Telegram interface with owner/admin/viewer access boundaries."""
 from datetime import datetime, timezone
+import re
+
 from bot import __version__
+from bot.diagnostics import demo_screen, report, setup_summary
 from bot.funpay_probe import status_from_environment
+from bot.settings import SettingsError
+
+_ID = re.compile(r'^[1-9][0-9]{0,18}$')
 
 
-def allowed(message, admin_id):
-    user = message.get("from") or {}
-    chat = message.get("chat") or {}
-    return (user.get("id") == admin_id and chat.get("type") == "private"
-            and chat.get("id") == admin_id)
+def role_for(user_id, owner_id, settings=None):
+    if settings is not None:
+        return settings.role(user_id)
+    return 'owner' if type(user_id) is int and user_id == owner_id else None
 
 
-def menu():
-    return {"inline_keyboard": [
-        [{"text": "📊 Статус", "callback_data": "m:status"},
-         {"text": "🧩 Плагины", "callback_data": "m:plugins"},
-         {"text": "🔑 FunPay (тест)", "callback_data": "m:funpay"}],
-        [{"text": "🏓 Связь", "callback_data": "m:ping"},
-         {"text": "🏠 Главная", "callback_data": "m:home"}]]}
+def allowed(message, admin_id, settings=None):
+    user = message.get('from') or {}
+    chat = message.get('chat') or {}
+    uid = user.get('id')
+    return (role_for(uid, admin_id, settings) is not None and
+            chat.get('type') == 'private' and chat.get('id') == uid)
+
+
+def menu(role='owner'):
+    rows = [
+        [{'text': '📊 Статус', 'callback_data': 'm:status'},
+         {'text': '🩺 Диагностика', 'callback_data': 'm:diagnostics'}],
+        [{'text': '🔑 FunPay (тест)', 'callback_data': 'm:funpay'},
+         {'text': '🎭 Демо', 'callback_data': 'm:demo'}],
+        [{'text': '🔔 Уведомления', 'callback_data': 'm:notifications'},
+         {'text': '🧭 Настройка', 'callback_data': 'm:setup'}],
+    ]
+    if role == 'owner':
+        rows.append([{'text': '👥 Администраторы', 'callback_data': 'm:admins'},
+                     {'text': '🧩 Плагины', 'callback_data': 'm:plugins'}])
+    rows.append([{'text': '🏓 Связь', 'callback_data': 'm:ping'},
+                 {'text': '🏠 Главная', 'callback_data': 'm:home'}])
+    return {'inline_keyboard': rows}
+
+
+def alerts_menu(settings, user_id):
+    active = bool(settings and settings.startup_enabled(user_id))
+    return {'inline_keyboard': [
+        [{'text': ('✅ ' if active else '⚪ ') + 'Уведомлять о запуске бота',
+          'callback_data': 'a:startup'}],
+        [{'text': '⬅️ Главное меню', 'callback_data': 'm:home'}]
+    ]}
 
 
 def plugin_menu(plugins):
-    rows = [[{"text": ("✅ " if enabled else "⚪ ") + info.name,
-             "callback_data": "p:toggle:" + info.command}]
+    rows = [[{'text': ('✅ ' if enabled else '⚪ ') + info.name,
+              'callback_data': 'p:toggle:' + info.command}]
             for info, enabled in plugins.list_all_plugins()[:20]]
-    rows.append([{"text": "⬅️ Назад", "callback_data": "m:home"}])
-    return {"inline_keyboard": rows}
+    rows.append([{'text': '⬅️ Назад', 'callback_data': 'm:home'}])
+    return {'inline_keyboard': rows}
 
 
 def plugins_text(plugins):
     items = plugins.list_all_plugins()
     if not items:
-        return "🧩 Плагинов пока нет."
-    return "🧩 Мои плагины:\n\n" + "\n".join(
-        ("✅ " if enabled else "⚪ ") + info.name + " — /" + info.command
-        for info, enabled in items
-    ) + "\n\nНажми кнопку, чтобы включить или отключить плагин."
+        return '🧩 Плагинов пока нет.'
+    return ('🧩 Мои плагины:\n\n' + '\n'.join(
+        ('✅ ' if enabled else '⚪ ') + info.name + ' — /' + info.command
+        for info, enabled in items) + '\n\nНажми кнопку, чтобы переключить плагин.')
 
 
-def reply_for(message, admin_id, plugins, started_at, funpay_status=status_from_environment):
-    if not allowed(message, admin_id):
+def admins_text(settings):
+    if settings is None:
+        return 'Управление пользователями сейчас недоступно.'
+    lines = [f'• {uid}: {role}' for uid, role in settings.list_admins()]
+    return ('👥 Доступ к FunPay Rust\n\n' + '\n'.join(lines) + '\n\n'
+            'Добавить: /addadmin 123456789 viewer\n'
+            'Роль admin: /addadmin 123456789 admin\n'
+            'Удалить: /removeadmin 123456789\n\n'
+            'Только владелец меняет роли. Друг должен сам открыть бота и нажать /start.\n'
+            'Админы и наблюдатели не могут управлять доступом или исполнять плагины.')
+
+
+def notifications_text(settings, uid):
+    active = bool(settings and settings.startup_enabled(uid))
+    return ('🔔 Центр уведомлений\n\n'
+            f'Уведомление о запуске бота: {"включено" if active else "выключено"}\n'
+            'Уведомления о заказах: ещё не реализованы.\n'
+            'Внешняя проверка доступности VPS: ещё не подключена.\n\n'
+            'Настройки применяются сразу, без перезапуска.')
+
+
+def _add_admin(args, settings):
+    parts = args.split()
+    if len(parts) not in (1, 2) or not _ID.fullmatch(parts[0]):
+        return 'Используй: /addadmin <Telegram ID> [viewer|admin]'
+    role = parts[1] if len(parts) == 2 else 'viewer'
+    if role not in ('admin', 'viewer'):
+        return 'Роль должна быть viewer или admin.'
+    try:
+        ok = settings.add(int(parts[0]), role)
+    except SettingsError:
+        return '❌ Не удалось безопасно сохранить настройки.'
+    return ('✅ Доступ настроен. Попроси пользователя открыть бота и нажать /start.'
+            if ok else '❌ Нельзя добавить пользователя. Проверь ID и лимит (5).')
+
+
+def _remove_admin(args, settings):
+    if not _ID.fullmatch(args.strip()):
+        return 'Используй: /removeadmin <Telegram ID>'
+    try:
+        ok = settings.remove(int(args.strip()))
+    except SettingsError:
+        return '❌ Не удалось безопасно сохранить настройки.'
+    return '✅ Доступ отозван.' if ok else '❌ Пользователь не найден или владелец.'
+
+
+def reply_for(message, admin_id, plugins, started_at,
+              funpay_status=status_from_environment, settings=None):
+    if not allowed(message, admin_id, settings):
         return None
-    text = message.get("text")
-    if not isinstance(text, str) or not text.strip().startswith("/"):
+    text = message.get('text')
+    if not isinstance(text, str) or not text.strip().startswith('/'):
         return None
     parts = text.strip().split(maxsplit=1)
-    command = parts[0][1:].split("@")[0].lower()
-    args = parts[1] if len(parts) == 2 else ""
-    if command in ("start", "help", "menu"):
-        return (f"🐱 FunPay Rus v{__version__}\n\nУправление через кнопки.\n"
-                "/status — состояние\n/plugins — плагины\n/ping — связь\n"
-                "/funpay — тест подключения (только чтение)\n\n"
-                "⚠️ Автовыдача и обработка заказов пока отключены.")
-    if command == "status":
+    command = parts[0][1:].split('@')[0].lower()
+    args = parts[1] if len(parts) == 2 else ''
+    uid = message['from']['id']
+    role = role_for(uid, admin_id, settings)
+
+    if command in ('start', 'help', 'menu'):
+        return (f'🐱 FunPay Rust v{__version__}\n\n'
+                f'Твоя роль: {role}\n\n'
+                '/status — состояние\n/diagnostics — диагностика VPS\n'
+                '/notifications — центр уведомлений\n/demo — демо-режим\n'
+                '/setup — мастер настройки\n/funpay — тест соединения\n'
+                + ('/admins — управление доступом\n/plugins — плагины\n' if role == 'owner' else '')
+                + '\n⚠️ Заказы и автовыдача ещё не включены.')
+    if command == 'status':
         seconds = max(0, int((datetime.now(timezone.utc) - started_at).total_seconds()))
-        return (f"✅ FunPay Rus {__version__} работает\n"
-                f"⏱ Время работы: {seconds // 60} мин.\n"
-                f"🧩 Плагинов активно: {len(plugins.commands)}")
-    if command == "ping":
-        return "🏓 Pong! Бот на связи."
-    if command == "plugins":
-        return plugins_text(plugins)
-    if command == "funpay":
-        return funpay_status()
-    return plugins.execute(command, args)
+        return (f'✅ FunPay Rust v{__version__} работает\n'
+                f'⏱ Время работы: {seconds // 60} мин.\n'
+                f'👤 Роль: {role}\n'
+                f'🧩 Активных плагинов: {len(plugins.commands)}')
+    if command == 'ping':
+        return '🏓 Pong! Бот на связи.'
+    if command == 'diagnostics':
+        return report(plugins, settings)
+    if command == 'setup':
+        return setup_summary(settings)
+    if command == 'demo':
+        return demo_screen()
+    if command == 'notifications':
+        return notifications_text(settings, uid)
+    if command == 'funpay':
+        return funpay_status() if role in ('owner', 'admin') else '🔒 Проверка FunPay доступна администраторам.'
+    if command == 'admins':
+        return admins_text(settings) if role == 'owner' else '🔒 Только владелец управляет доступом.'
+    if command == 'addadmin':
+        return _add_admin(args, settings) if role == 'owner' and settings else '🔒 Только владелец управляет доступом.'
+    if command == 'removeadmin':
+        return _remove_admin(args, settings) if role == 'owner' and settings else '🔒 Только владелец управляет доступом.'
+    if command == 'plugins':
+        return plugins_text(plugins) if role == 'owner' else '🔒 Доступ к плагинам ограничен владельцем.'
+    return plugins.execute(command, args) if role == 'owner' else None
 
 
-def callback_for(callback, admin_id, plugins, started_at, funpay_status=status_from_environment):
-    check = {"from": callback.get("from"), "chat": (callback.get("message") or {}).get("chat")}
-    if not allowed(check, admin_id):
+def keyboard_for_command(text, plugins, settings=None, user_id=None, owner_id=None):
+    command = text.strip().split(maxsplit=1)[0].split('@')[0].lower() if text and text.strip() else ''
+    if command == '/plugins' and role_for(user_id, owner_id, settings) == 'owner':
+        return plugin_menu(plugins)
+    if command == '/notifications':
+        return alerts_menu(settings, user_id)
+    return menu(role_for(user_id, owner_id, settings))
+
+
+def callback_for(callback, admin_id, plugins, started_at,
+                 funpay_status=status_from_environment, settings=None):
+    check = {'from': callback.get('from'), 'chat': (callback.get('message') or {}).get('chat')}
+    if not allowed(check, admin_id, settings):
         return None
-    data = callback.get("data")
-    if data in ("m:home", "m:help"):
-        return reply_for({**check, "text": "/start"}, admin_id, plugins, started_at,
-                         funpay_status), menu()
-    if data == "m:status":
-        return reply_for({**check, "text": "/status"}, admin_id, plugins, started_at,
-                         funpay_status), menu()
-    if data == "m:ping":
-        return "🏓 Pong! Бот на связи.", menu()
-    if data == "m:funpay":
-        return funpay_status(), menu()
-    if data == "m:plugins":
-        return plugins_text(plugins), plugin_menu(plugins)
-    if isinstance(data, str) and data.startswith("p:toggle:"):
-        command = data[len("p:toggle:"):]
+    uid = check['from']['id']
+    role = role_for(uid, admin_id, settings)
+    data = callback.get('data')
+    sections = {'m:home': '/start', 'm:help': '/start', 'm:status': '/status',
+                'm:ping': '/ping', 'm:funpay': '/funpay',
+                'm:plugins': '/plugins', 'm:diagnostics': '/diagnostics',
+                'm:setup': '/setup', 'm:demo': '/demo',
+                'm:notifications': '/notifications', 'm:admins': '/admins'}
+    if data in sections:
+        command = sections[data]
+        output = reply_for({**check, 'text': command}, admin_id, plugins, started_at,
+                           funpay_status=funpay_status, settings=settings)
+        return output, keyboard_for_command(command, plugins, settings, uid, admin_id)
+    if data == 'a:startup':
+        try:
+            if not settings or not settings.toggle_startup(uid):
+                return '❌ Не удалось изменить настройки.', alerts_menu(settings, uid)
+        except SettingsError:
+            return '❌ Не удалось сохранить настройки.', alerts_menu(settings, uid)
+        return notifications_text(settings, uid), alerts_menu(settings, uid)
+    if isinstance(data, str) and data.startswith('p:toggle:'):
+        if role != 'owner':
+            return '🔒 Только владелец управляет плагинами.', menu(role)
+        command = data[len('p:toggle:'):]
         if command not in plugins.available:
-            return "❌ Плагин не найден.", plugin_menu(plugins)
+            return '❌ Плагин не найден.', plugin_menu(plugins)
         if not plugins.set_enabled(command, command not in plugins.commands):
-            return "❌ Не удалось сохранить состояние плагина.", plugin_menu(plugins)
+            return '❌ Не удалось сохранить состояние плагина.', plugin_menu(plugins)
         return plugins_text(plugins), plugin_menu(plugins)
     return None
