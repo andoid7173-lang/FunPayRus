@@ -72,6 +72,7 @@ def orders_menu(settings, uid, orders=None):
                     rows.append([button])
         except OrderMonitorError:
             pass  # Keep the section usable if SQLite is temporarily unavailable.
+    rows.append([{'text': '⚡ Проверить сейчас', 'callback_data': 'o:check'}])
     rows.append([{'text': '🔄 Обновить экран', 'callback_data': 'm:orders'}])
     rows.append([{'text': '⬅️ Назад', 'callback_data': 'm:home'}])
     return {'inline_keyboard': rows}
@@ -84,7 +85,7 @@ def orders_screen(settings, orders):
     result = ['📦 Заказы FunPay — тест только на чтение',
               'Мониторинг: ' + ('✅ включён' if enabled else '⏸ выключен'),
               'Первый успешный опрос сохраняет историю без уведомлений.',
-              'Опрос: примерно каждые 90 секунд, только первая страница продаж.']
+              'Опрос: примерно каждые 30 секунд, только первая страница продаж.']
     if orders.last_error:
         result.append('⚠️ Последняя ошибка: ' + orders.last_error)
     try:
@@ -167,7 +168,7 @@ def _remove_admin(args, settings):
 
 
 def reply_for(message, admin_id, plugins, started_at,
-              funpay_status=status_from_environment, settings=None, orders=None):
+              funpay_status=status_from_environment, settings=None, orders=None, poll_now=None):
     if not allowed(message, admin_id, settings):
         return None
     text = message.get('text')
@@ -206,10 +207,37 @@ def reply_for(message, admin_id, plugins, started_at,
         return notifications_text(settings, uid)
     if command == 'funpay':
         return funpay_status() if role in ('owner', 'admin') else '🔒 Проверка FunPay доступна администраторам.'
+    if command == 'testalert':
+        if role not in ('owner', 'admin'):
+            return '🔒 Тест доступен только администраторам.'
+        return ('🧪 ТЕСТ УВЕДОМЛЕНИЯ FunPay Rust\\n\\n'
+                'Это проверка доставки в Telegram. Реальной покупки нет, '
+                'к FunPay запрос не отправлялся.')
+    if command == 'findorder':
+        if role not in ('owner', 'admin'):
+            return '🔒 Поиск заказов доступен только администраторам.'
+        if not 1 <= len(args.strip()) <= 80:
+            return 'Используй: /findorder <номер заказа, покупатель или товар>'
+        try:
+            matches = orders.find(args.strip()) if orders else []
+        except OrderMonitorError:
+            return '⚠️ Поиск временно недоступен.'
+        if not matches:
+            return '🔎 Совпадений в сохранённой истории нет. Это не поиск на сервере FunPay.'
+        return ('🔎 Результаты поиска (локальная история):\\n\\n'
+                + '\\n\\n'.join(
+                    f'#{x.order_id}: {x.status} — {x.description[:70]}'
+                    for x in matches))
     if command == 'orders':
         if role not in ('owner', 'admin'):
             return '🔒 Заказы доступны только администраторам.'
-        if args.strip() in ('on', 'off'):
+        if args.strip() == 'now':
+            if settings is None or not settings.monitor_enabled():
+                return '⚠️ Сначала включи мониторинг: /orders on'
+            if poll_now is None:
+                return '⚠️ Ручная проверка недоступна в этом режиме.'
+            poll_now()
+        elif args.strip() in ('on', 'off'):
             if role != 'owner' or settings is None:
                 return '🔒 Только владелец включает мониторинг.'
             try:
@@ -217,7 +245,7 @@ def reply_for(message, admin_id, plugins, started_at,
             except SettingsError:
                 return '❌ Не удалось сохранить режим мониторинга.'
         elif args.strip():
-            return 'Используй: /orders [on|off]'
+            return 'Используй: /orders [on|off|now]'
         return orders_screen(settings, orders)
     if command == 'admins':
         return admins_text(settings) if role == 'owner' else '🔒 Только владелец управляет доступом.'
@@ -238,11 +266,15 @@ def keyboard_for_command(text, plugins, settings=None, user_id=None, owner_id=No
         return alerts_menu(settings, user_id)
     if command == '/orders':
         return orders_menu(settings, user_id, orders)
+    if command == '/findorder' and orders and settings and settings.role(user_id) in ('owner', 'admin'):
+        return {'inline_keyboard': [[b] for b in (
+            order_button(o.order_id) for o in orders.find(text.partition(' ')[2])
+        ) if b] + [[{'text': '⬅️ Назад', 'callback_data': 'm:orders'}]]}
     return menu(role_for(user_id, owner_id, settings))
 
 
 def callback_for(callback, admin_id, plugins, started_at,
-                 funpay_status=status_from_environment, settings=None, orders=None):
+                 funpay_status=status_from_environment, settings=None, orders=None, poll_now=None):
     check = {'from': callback.get('from'), 'chat': (callback.get('message') or {}).get('chat')}
     if not allowed(check, admin_id, settings):
         return None
@@ -258,8 +290,16 @@ def callback_for(callback, admin_id, plugins, started_at,
     if data in sections:
         command = sections[data]
         output = reply_for({**check, 'text': command}, admin_id, plugins, started_at,
-                           funpay_status=funpay_status, settings=settings, orders=orders)
+                           funpay_status=funpay_status, settings=settings, orders=orders, poll_now=poll_now)
         return output, keyboard_for_command(command, plugins, settings, uid, admin_id, orders)
+    if data == 'o:check':
+        if role not in ('owner', 'admin') or settings is None:
+            return '🔒 Проверка доступна администраторам.', menu(role)
+        if not settings.monitor_enabled():
+            return '⚠️ Сначала включи мониторинг.', orders_menu(settings, uid, orders)
+        if poll_now is not None:
+            poll_now()
+        return orders_screen(settings, orders), orders_menu(settings, uid, orders)
     if data == 'o:toggle':
         if role != 'owner' or settings is None:
             return '🔒 Только владелец включает мониторинг.', menu(role)
