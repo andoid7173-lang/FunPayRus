@@ -27,7 +27,7 @@ if ! command -v git >/dev/null 2>&1; then
   exit 1
 fi
 APP_VERSION="$(python3 -c 'from bot import __version__; print(__version__)')"
-printf '\n🐱 FunPay Rus — установщик v%s\n' "$APP_VERSION"
+printf '\n🐱 FunPay Rust — установщик v%s\n' "$APP_VERSION"
 printf '%s\n' '============================================'
 printf '%s\n' 'Для настройки нужны Telegram Bot Token от @BotFather'
 printf '%s\n' 'и числовой Telegram ID администратора.'
@@ -80,7 +80,7 @@ fi
 # A separate optional EnvironmentFile lets the test run without FunPay enabled.
 cat > "$SERVICE_FILE" <<'UNIT'
 [Unit]
-Description=FunPay Rus Telegram Admin Bot
+Description=FunPay Rust Telegram Admin Bot
 After=network-online.target
 Wants=network-online.target
 
@@ -124,7 +124,7 @@ systemctl enable funpayrus >/dev/null
 systemctl restart funpayrus
 sleep 3
 if systemctl is-active --quiet funpayrus; then
-  printf '\n✅ FunPay Rus v%s запущен!\n' "$APP_VERSION"
+  printf '\n✅ FunPay Rust v%s запущен!\n' "$APP_VERSION"
   echo 'Telegram: /start; тест подключения FunPay: /funpay'
   echo 'Проверка журнала: sudo journalctl -u funpayrus -n 30 --no-pager'
 else
