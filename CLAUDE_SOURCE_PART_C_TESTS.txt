@@ -1,0 +1,1055 @@
+FUNPAY RUST CLAUDE BUNDLE — PART C / ALL TESTS
+SOURCE MAIN COMMIT e8cdd0e49364331bed6cb697daf7e5e8bc96c8c3
+
+===== BEGIN FILE tests/test_bot.py =====
+import unittest
+from datetime import datetime, timezone
+from pathlib import Path
+from bot.commands import reply_for
+from bot.plugins import PluginManager
+
+ROOT = Path(__file__).resolve().parents[1]
+
+class TestBot(unittest.TestCase):
+    def setUp(self):
+        self.plugins = PluginManager(ROOT / 'plugins')
+        self.start = datetime.now(timezone.utc)
+
+    def incoming(self, user, command, chat_type='private', chat_id=None):
+        return {'from': {'id': user}, 'chat': {'id': chat_id if chat_id is not None else user,
+                'type': chat_type}, 'text': command}
+
+    def test_private_admin(self):
+        self.assertIn('FunPay Rust', reply_for(self.incoming(10, '/start'), 10, self.plugins, self.start))
+
+    def test_block_other_user(self):
+        self.assertIsNone(reply_for(self.incoming(11, '/status'), 10, self.plugins, self.start))
+
+    def test_block_group(self):
+        self.assertIsNone(reply_for(self.incoming(10, '/status', 'group', -100), 10, self.plugins, self.start))
+
+    def test_plugins_loaded(self):
+        self.assertIn('/hello', reply_for(self.incoming(10, '/plugins'), 10, self.plugins, self.start))
+        self.assertIn('Привет', reply_for(self.incoming(10, '/hello'), 10, self.plugins, self.start))
+
+    def test_ping(self):
+        self.assertIn('Pong', reply_for(self.incoming(10, '/ping'), 10, self.plugins, self.start))
+
+===== END FILE tests/test_bot.py =====
+
+===== BEGIN FILE tests/test_config.py =====
+import unittest
+from bot.config import Config
+
+TOKEN = "123456789:" + "A" * 35
+
+class TestConfig(unittest.TestCase):
+    def test_accepts_valid(self):
+        config = Config.load({"BOT_TOKEN": TOKEN, "ADMIN_ID": "123456"})
+        self.assertEqual(config.admin_id, 123456)
+    def test_rejects_missing_token(self):
+        with self.assertRaises(ValueError):
+            Config.load({"ADMIN_ID": "123456"})
+    def test_rejects_bad_admin(self):
+        with self.assertRaises(ValueError):
+            Config.load({"BOT_TOKEN": TOKEN, "ADMIN_ID": "admin"})
+
+===== END FILE tests/test_config.py =====
+
+===== BEGIN FILE tests/test_features_031.py =====
+import json
+import os
+from datetime import datetime, timezone
+from pathlib import Path
+from tempfile import TemporaryDirectory
+import unittest
+
+from bot.commands import allowed, callback_for, reply_for, menu
+from bot.diagnostics import demo_screen, report
+from bot.plugins import PluginManager
+from bot.settings import Settings, SettingsError
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+class TestSecurityAndRoles(unittest.TestCase):
+    def setUp(self):
+        self.tmp = TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.file = Path(self.tmp.name) / 'settings.json'
+        self.settings = Settings(100, self.file)
+        self.plugins = PluginManager(ROOT / 'plugins')
+        self.start = datetime.now(timezone.utc)
+
+    def msg(self, uid, command, chat_type='private', chat_id=None):
+        return {'from': {'id': uid}, 'chat': {'id': uid if chat_id is None else chat_id,
+                'type': chat_type}, 'text': command}
+
+    def cb(self, uid, data):
+        return {'from': {'id': uid}, 'message': {'chat': {'id': uid, 'type': 'private'},
+                'message_id': 42}, 'data': data}
+
+    def reply(self, uid, cmd):
+        return reply_for(self.msg(uid, cmd), 100, self.plugins, self.start,
+                         settings=self.settings, funpay_status=lambda: 'FunPay OK')
+
+    def callback(self, uid, data):
+        return callback_for(self.cb(uid, data), 100, self.plugins, self.start,
+                            settings=self.settings, funpay_status=lambda: 'FunPay OK')
+
+    def test_add_roles_persistent(self):
+        self.assertIn('✅', self.reply(100, '/addadmin 200 admin'))
+        self.assertEqual(Settings(100, self.file).role(200), 'admin')
+        self.assertIn('✅', self.reply(100, '/addadmin 300'))
+        self.assertEqual(Settings(100, self.file).role(300), 'viewer')
+        self.assertIn('✅', self.reply(100, '/removeadmin 200'))
+        self.assertIsNone(Settings(100, self.file).role(200))
+
+    def test_roles_cannot_escalate_or_toggle_plugins(self):
+        self.settings.add(200, 'admin')
+        self.settings.add(300, 'viewer')
+        self.assertIn('Только владелец', self.reply(200, '/addadmin 400 admin'))
+        self.assertIn('Только владелец', self.reply(300, '/removeadmin 200'))
+        self.assertIn('Только владелец', self.callback(200, 'p:toggle:hello')[0])
+        self.assertIn('hello', self.plugins.commands)
+        self.assertIn('ограничен', self.reply(200, '/plugins'))
+        self.assertIn('доступна администраторам', self.reply(300, '/funpay'))
+        self.assertIsNone(self.reply(300, '/hello'))
+
+    def test_disallow_wrong_chat_and_impersonated_sender(self):
+        self.settings.add(200, 'admin')
+        self.assertFalse(allowed(self.msg(200, '/status', 'group', -100), 100, self.settings))
+        self.assertFalse(allowed(self.msg(200, '/status', 'private', 100), 100, self.settings))
+        self.assertFalse(allowed(self.msg(201, '/status'), 100, self.settings))
+        self.assertIsNone(reply_for(self.msg(201, '/status'), 100, self.plugins, self.start,
+                                     settings=self.settings))
+
+    def test_notification_persistence_and_owner_is_immutable(self):
+        self.settings.add(200, 'viewer')
+        self.assertFalse(self.settings.remove(100))
+        self.assertTrue(self.settings.toggle_startup(200))
+        self.assertTrue(Settings(100, self.file).startup_enabled(200))
+        self.assertIn('включено', self.callback(200, 'm:notifications')[0])
+        self.callback(200, 'a:startup')
+        self.assertFalse(Settings(100, self.file).startup_enabled(200))
+        self.assertEqual(self.settings.alert_recipients(), [])
+        self.assertTrue(self.settings.toggle_startup(200))
+        self.settings.remove(200)
+        self.assertEqual(self.settings.alert_recipients(), [])
+
+    def test_roles_cannot_add_owner_or_exceed_limit(self):
+        self.assertFalse(self.settings.add(100, 'admin'))
+        for i in range(101, 106):
+            self.assertTrue(self.settings.add(i, 'viewer'))
+        self.assertFalse(self.settings.add(106))
+        self.assertEqual(self.settings.role(100), 'owner')
+
+    def test_invalid_and_symlink_settings_fail_closed(self):
+        self.file.write_text('{"admins":{"100":"admin"},"startup_alerts":[]}', encoding='utf8')
+        with self.assertRaises(SettingsError):
+            Settings(100, self.file)
+        self.file.unlink()
+        target = self.file.with_name('target.json')
+        target.write_text('{"admins":{},"startup_alerts":[]}', encoding='utf8')
+        if hasattr(os, 'symlink'):
+            self.file.symlink_to(target)
+            with self.assertRaises(SettingsError):
+                Settings(100, self.file)
+
+    def test_no_auto_enable_and_file_permissions(self):
+        self.settings.add(200)
+        obj = json.loads(self.file.read_text(encoding='utf8'))
+        self.assertEqual(obj, {'admins': {'200': 'viewer'}, 'startup_alerts': [],
+                               'order_alerts': [], 'order_monitor': False})
+        if os.name == 'posix':
+            self.assertEqual(self.file.stat().st_mode & 0o777, 0o600)
+
+    def test_ui_and_diagnostics_are_explicit(self):
+        self.assertGreaterEqual(len(menu()['inline_keyboard']), 4)
+        self.assertIn('ДЕМОНСТРАЦИЯ', demo_screen())
+        self.assertIn('ключ не указан', report(self.plugins, state_dir=Path(self.tmp.name), env={}))
+        self.assertNotIn('FakeSecret123', report(self.plugins, state_dir=Path(self.tmp.name),
+                                                 env={'FUNPAY_GOLDEN_KEY': 'FakeSecret123'}))
+        self.assertIn('запущен', self.reply(200 if self.settings.role(200) else 100, '/setup'))
+
+class TestServiceDispatchToSecondAdmin(unittest.TestCase):
+    def test_second_admin_receives_own_reply_and_startup_notice(self):
+        from bot import __main__ as service
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        class FakeTelegram:
+            seen = []
+            def __init__(self, token):
+                self.token = token
+            def call(self, method, payload=None):
+                return {'id': 99}
+            def updates(self, offset):
+                service.RUNNING = False
+                return [{'update_id': 70, 'message': {'from': {'id': 200},
+                         'chat': {'id': 200, 'type': 'private'}, 'text': '/status'}}]
+            def send(self, chat_id, message, reply_markup=None):
+                self.seen.append((chat_id, message))
+            def acknowledge(self, *args):
+                pass
+
+        with TemporaryDirectory() as tmp:
+            settings = Settings(100, Path(tmp) / 'settings.json')
+            settings.add(200, 'admin')
+            settings.toggle_startup(200)
+            old_dir, old_running = service.STATE_DIR, service.RUNNING
+            self.addCleanup(setattr, service, 'STATE_DIR', old_dir)
+            self.addCleanup(setattr, service, 'RUNNING', old_running)
+            service.STATE_DIR = Path(tmp)
+            FakeTelegram.seen = []
+            with patch.object(service.Config, 'load', return_value=SimpleNamespace(bot_token='fake', admin_id=100)), \
+                 patch.object(service, 'TelegramAPI', FakeTelegram), \
+                 patch.object(service.signal, 'signal'):
+                service.RUNNING = True
+                self.assertEqual(service.main(), 0)
+            self.assertEqual([uid for uid, _ in FakeTelegram.seen], [200, 200])
+            self.assertIn('запущен', FakeTelegram.seen[0][1])
+            self.assertIn('FunPay Rust', FakeTelegram.seen[1][1])
+
+===== END FILE tests/test_features_031.py =====
+
+===== BEGIN FILE tests/test_main_beta.py =====
+"""End-to-end dry run of Telegram dispatch without network or VPS access."""
+import tempfile
+from pathlib import Path
+from types import SimpleNamespace
+import unittest
+from unittest.mock import patch
+from bot import __main__ as service
+
+
+class FakeTelegram:
+    delivered = []
+    offsets = []
+
+    def __init__(self, token):
+        assert token == "fake"
+
+    def call(self, method, payload=None):
+        assert method == "getMe"
+        return {"id": 99}
+
+    def updates(self, offset):
+        self.offsets.append(offset)
+        service.RUNNING = False
+        return [{"update_id": 50, "message": {
+            "from": {"id": 7}, "chat": {"id": 7, "type": "private"},
+            "text": "/ping"
+        }}]
+
+    def send(self, chat_id, message, reply_markup):
+        self.delivered.append((chat_id, message))
+
+    def acknowledge(self, callback_id):
+        pass
+
+
+class TestService(unittest.TestCase):
+    def test_resumed_restart_does_not_repeat_action(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            old_dir = service.STATE_DIR
+            old_running = service.RUNNING
+            self.addCleanup(setattr, service, "STATE_DIR", old_dir)
+            self.addCleanup(setattr, service, "RUNNING", old_running)
+            service.STATE_DIR = Path(tmp)
+            FakeTelegram.delivered = []
+            FakeTelegram.offsets = []
+            with patch.object(service.Config, "load", return_value=SimpleNamespace(bot_token="fake", admin_id=7)), \
+                 patch.object(service, "TelegramAPI", FakeTelegram), \
+                 patch.object(service.signal, "signal"):
+                service.RUNNING = True
+                self.assertEqual(service.main(), 0)
+                self.assertEqual(len(FakeTelegram.delivered), 1)
+                self.assertEqual(FakeTelegram.offsets, [0])
+                service.RUNNING = True
+                self.assertEqual(service.main(), 0)
+                self.assertEqual(len(FakeTelegram.delivered), 1)
+                self.assertEqual(FakeTelegram.offsets, [0, 51])
+
+===== END FILE tests/test_main_beta.py =====
+
+===== BEGIN FILE tests/test_menu.py =====
+import unittest
+from datetime import datetime, timezone
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from bot.commands import callback_for, menu, plugin_menu
+from bot.plugins import PluginManager
+
+ROOT = Path(__file__).resolve().parents[1]
+
+class TestMenu(unittest.TestCase):
+    def setUp(self):
+        self.tmp = TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name) / 'state.json'
+        self.plugins = PluginManager(ROOT / 'plugins', state_file=self.path)
+        self.start = datetime.now(timezone.utc)
+
+    def event(self, user=100, data='m:home', chat_type='private'):
+        return {'from': {'id': user}, 'message': {'chat': {'id': 100, 'type': chat_type},
+                                                     'message_id': 42}, 'data': data}
+
+    def test_buttons(self):
+        self.assertGreaterEqual(len(menu()['inline_keyboard']), 4)
+        self.assertTrue(plugin_menu(self.plugins)['inline_keyboard'])
+
+    def test_authorization(self):
+        self.assertIsNone(callback_for(self.event(user=101), 100, self.plugins, self.start))
+        self.assertIsNone(callback_for(self.event(chat_type='group'), 100, self.plugins, self.start))
+
+    def test_toggle_persistent(self):
+        self.assertIn('hello', self.plugins.commands)
+        callback_for(self.event(data='p:toggle:hello'), 100, self.plugins, self.start)
+        self.assertNotIn('hello', self.plugins.commands)
+        self.assertTrue(self.path.exists())
+        fresh = PluginManager(ROOT / 'plugins', state_file=self.path)
+        self.assertNotIn('hello', fresh.commands)
+        callback_for(self.event(data='p:toggle:hello'), 100, fresh, self.start)
+        self.assertIn('hello', PluginManager(ROOT / 'plugins', state_file=self.path).commands)
+
+===== END FILE tests/test_menu.py =====
+
+===== BEGIN FILE tests/test_order_links_032.py =====
+"""Tests for safe FunPay order links in Telegram."""
+import tempfile
+import unittest
+from pathlib import Path
+from datetime import datetime, timezone
+from bot.orders import Order, OrderStore, order_url, order_button
+from bot.settings import Settings
+from bot.commands import orders_menu, callback_for
+from bot.plugins import PluginManager
+from bot import __main__ as service
+
+class TestOrderLinks(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        d = Path(self.tmp.name)
+        self.store = OrderStore(d / 'orders.sqlite3')
+        self.settings = Settings(100, d / 'settings.json')
+        self.settings.add(200, 'admin')
+        self.settings.add(300, 'viewer')
+        self.plugins = PluginManager(d / 'plugins')
+        self.start = datetime.now(timezone.utc)
+
+    def test_direct_url(self):
+        self.assertEqual(order_url('BLJR8N7E'), 'https://funpay.com/orders/BLJR8N7E/')
+        self.assertEqual(order_button('BLJR8N7E')['url'], order_url('BLJR8N7E'))
+
+    def test_untrusted_ids_never_become_links(self):
+        for value in ('', 'A', '../admin', '//evil.com', 'ID123/?key=x',
+                      'https://evil.com', 'АБВ1234', 'AB1234\n', 'ID1234%2F', None, 45):
+            with self.subTest(value=value):
+                self.assertIsNone(order_url(value))
+                self.assertIsNone(order_button(value))
+
+    def test_new_sale_sends_button_only_to_subscribers(self):
+        self.settings.set_monitor(True)
+        self.settings.toggle_order_alert(100)
+        self.settings.toggle_order_alert(200)
+        class API:
+            sent = []
+            def send(self, user, message, reply_markup=None):
+                self.sent.append((user, message, reply_markup))
+        api = API()
+        first = lambda key, user_agent=None: [Order('OLD10001', 'paid')]
+        second = lambda key, user_agent=None: [Order('OLD10001','paid'),
+                                               Order('NEW10002','paid','Тест')]
+        self.assertEqual(service.poll_orders_once(self.store, self.settings, api,
+                         key='A'*32, fetcher=first), 0)
+        self.assertEqual(service.poll_orders_once(self.store, self.settings, api,
+                         key='A'*32, fetcher=second), 1)
+        self.assertEqual([e[0] for e in api.sent], [100, 200])
+        for user, text, markup in api.sent:
+            self.assertIn('NEW10002', text)
+            self.assertEqual(markup['inline_keyboard'][0][0]['url'],
+                             'https://funpay.com/orders/NEW10002/')
+            self.assertNotIn('A'*32, str(markup))
+        self.assertEqual(service.poll_orders_once(self.store, self.settings, api,
+                         key='A'*32, fetcher=second), 0)
+
+    def test_history_order_buttons_role_gated(self):
+        self.store.record([Order('OLD10001','paid'), Order('OLD10002','closed')])
+        for user in (100, 200):
+            markup = orders_menu(self.settings, user, self.store)
+            urls = [b['url'] for row in markup['inline_keyboard']
+                    for b in row if 'url' in b]
+            self.assertEqual(set(urls), {'https://funpay.com/orders/OLD10001/',
+                                         'https://funpay.com/orders/OLD10002/'})
+            event = {'from': {'id': user}, 'message': {
+                     'chat': {'id': user, 'type': 'private'}, 'message_id': 71},
+                     'data': 'm:orders'}
+            reply = callback_for(event, 100, self.plugins, self.start,
+                                 settings=self.settings, orders=self.store)
+            self.assertTrue(any('url' in b for row in reply[1]['inline_keyboard']
+                                for b in row))
+        self.assertFalse(any('url' in b for row in
+                             orders_menu(self.settings, 300, self.store)['inline_keyboard']
+                             for b in row))
+        event = {'from': {'id': 300}, 'message': {
+                 'chat': {'id': 300, 'type': 'private'}, 'message_id': 71},
+                 'data': 'm:orders'}
+        reply = callback_for(event, 100, self.plugins, self.start,
+                             settings=self.settings, orders=self.store)
+        self.assertIn('🔒', reply[0])
+        self.assertFalse(any('url' in b for row in reply[1]['inline_keyboard']
+                             for b in row))
+
+    def test_empty_history_has_no_fake_button(self):
+        markup = orders_menu(self.settings, 100, self.store)
+        self.assertFalse(any('url' in b for row in markup['inline_keyboard']
+                             for b in row))
+
+===== END FILE tests/test_order_links_032.py =====
+
+===== BEGIN FILE tests/test_orders_032.py =====
+import json
+import os
+import tempfile
+import unittest
+from datetime import datetime, timezone
+from pathlib import Path
+from unittest.mock import patch
+from urllib.error import HTTPError
+
+from bot.orders import Order, OrderStore, OrderMonitorError, fetch_sales, ORDERS_URL, describe_order
+from bot.settings import Settings, SettingsError
+from bot.commands import reply_for, callback_for, menu
+from bot import __main__ as service
+from bot.plugins import PluginManager
+
+VALID_KEY = 'A' * 32
+
+
+def page(*items, authenticated=True):
+    header = ('<body data-app-data=\'{"userId":321}\'><div class="user-link-name">Seller</div>'
+              if authenticated else '<body><div>Login</div>')
+    return (header + ''.join(items) + '</body>').encode('utf-8')
+
+
+def card(oid='OD12345', status='paid', description='Лицензионный ключ', buyer='buyer', price='500 ₽'):
+    status_class = {'paid': 'info', 'refunded': 'warning', 'closed': ''}[status]
+    return (f'<a class="tc-item {status_class}" href="/orders/xxx">'
+            f'<div class="tc-order">#{oid}</div>'
+            f'<div class="order-desc"><div>{description}</div></div>'
+            f'<div class="tc-price">{price}</div>'
+            f'<div class="media-user-name"><span>{buyer}</span></div>'
+            '</a>')
+
+
+class FakeResponse:
+    def __init__(self, data, url=ORDERS_URL):
+        self.data = data
+        self.url = url
+    def geturl(self):
+        return self.url
+    def read(self, n):
+        return self.data[:n]
+    def __enter__(self):
+        return self
+    def __exit__(self, *args):
+        return None
+
+
+class FakeOpener:
+    def __init__(self, data, url=ORDERS_URL):
+        self.data = data
+        self.url = url
+        self.calls = 0
+    def open(self, req, timeout=12):
+        self.calls += 1
+        self.req = req
+        return FakeResponse(self.data, self.url)
+
+
+class TestHTMLSales(unittest.TestCase):
+    def test_parse_paid_closed_refunded(self):
+        opener = FakeOpener(page(card(), card('OD12346', 'closed'), card('OD12347', 'refunded')))
+        result = fetch_sales(VALID_KEY, opener=opener)
+        self.assertEqual([o.status for o in result], ['paid', 'closed', 'refunded'])
+        self.assertEqual(result[0].order_id, 'OD12345')
+        self.assertEqual(result[0].buyer, 'buyer')
+        self.assertIn('500', result[0].price)
+        self.assertEqual(opener.req.get_method(), 'GET')
+        self.assertEqual(opener.req.full_url, ORDERS_URL)
+        self.assertIn(VALID_KEY, opener.req.get_header('Cookie'))
+
+    def test_empty_authorized_page(self):
+        self.assertEqual(fetch_sales(VALID_KEY, opener=FakeOpener(page())), [])
+
+    def test_reject_login_redirect_and_bad_key(self):
+        with self.assertRaises(OrderMonitorError):
+            fetch_sales(VALID_KEY, opener=FakeOpener(page(authenticated=False)))
+        with self.assertRaises(OrderMonitorError):
+            fetch_sales(VALID_KEY, opener=FakeOpener(page(), 'https://other.example/'))
+        with self.assertRaises(OrderMonitorError):
+            fetch_sales('bad', opener=FakeOpener(page()))
+
+    def test_reject_large_html(self):
+        with self.assertRaises(OrderMonitorError):
+            fetch_sales(VALID_KEY, opener=FakeOpener(b'x' * (2*1024*1024 + 1)))
+
+    def test_http_errors_redacted(self):
+        class Failing:
+            def open(self, req, timeout=12):
+                raise HTTPError(req.full_url, 429, 'rate limit', {}, None)
+        with self.assertRaises(OrderMonitorError) as caught:
+            fetch_sales(VALID_KEY, opener=Failing())
+        self.assertIn('частоту', str(caught.exception))
+        self.assertNotIn(VALID_KEY, str(caught.exception))
+
+    def test_sanitizes_html_data(self):
+        result = fetch_sales(VALID_KEY, opener=FakeOpener(page(card(description='Hello\n\tWorld'))))
+        self.assertEqual(result[0].description, 'HelloWorld')
+        self.assertNotIn('golden_key', describe_order(result[0]))
+
+
+class TestOrderStore(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name) / 'orders.sqlite3'
+        self.store = OrderStore(self.path)
+
+    def test_first_snapshot_silent_and_new_order_notified_once(self):
+        old = Order('ORD10001', 'paid', 'До установки')
+        new = Order('ORD10002', 'paid', 'После установки')
+        self.assertEqual(self.store.record([old]), [])
+        self.assertEqual(self.store.record([old]), [])
+        self.assertEqual(self.store.record([old, new]), [new])
+        self.assertEqual(self.store.record([old, new]), [])
+        count, last, orders = OrderStore(self.path).summary()
+        self.assertEqual(count, 2)
+        self.assertTrue(last > 0)
+        self.assertEqual(len(orders), 2)
+        self.assertEqual(self.path.stat().st_mode & 0o777, 0o600)
+
+    def test_status_changes_without_repeat_new(self):
+        paid = Order('ORD10001', 'paid')
+        closed = Order('ORD10001', 'closed')
+        self.assertEqual(self.store.record([paid]), [])
+        self.assertEqual(self.store.record([closed]), [])
+        self.assertEqual(self.store.record([closed]), [])
+        self.assertEqual(self.store.summary()[2][0].status, 'closed')
+
+    def test_rejected_symlink(self):
+        self.path.unlink()
+        target = Path(self.tmp.name) / 'real.db'
+        target.write_bytes(b'')
+        self.path.symlink_to(target)
+        with self.assertRaises(OrderMonitorError):
+            OrderStore(self.path)
+
+    def test_initial_empty_page_silences_older_events(self):
+        self.assertEqual(self.store.record([]), [])
+        self.assertEqual(self.store.record([Order('ORD10001', 'paid')]),
+                         [Order('ORD10001', 'paid')])
+
+
+class FakeAPI:
+    def __init__(self):
+        self.sent = []
+    def send(self, user_id, text, reply_markup=None):
+        self.sent.append((user_id, text))
+
+
+class TestOrderIntegration(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.d = Path(self.tmp.name)
+        self.store = OrderStore(self.d / 'orders.db')
+        self.settings = Settings(100, self.d / 'settings.json')
+        self.settings.add(200, 'admin')
+        self.settings.add(300, 'viewer')
+        self.api = FakeAPI()
+        self.plugins = PluginManager(self.d / 'empty')
+        self.start = datetime.now(timezone.utc)
+
+    def message(self, uid, text):
+        return {'from': {'id': uid}, 'chat': {'id': uid, 'type': 'private'}, 'text': text}
+
+    def callback(self, uid, data):
+        return {'from': {'id': uid}, 'message': {'chat': {'id': uid, 'type': 'private'},
+                'message_id': 77}, 'data': data}
+
+    def test_opt_in_delivery_and_roles(self):
+        fetch_count = [0]
+        def mock_fetch(key, user_agent=None):
+            fetch_count[0] += 1
+            return [Order('ORD10001', 'paid', 'Товар')]
+        self.assertEqual(service.poll_orders_once(self.store, self.settings, self.api,
+                                                  key=VALID_KEY, fetcher=mock_fetch), 0)
+        self.assertEqual(fetch_count[0], 0)
+        self.settings.set_monitor(True)
+        self.settings.toggle_order_alert(100)
+        self.settings.toggle_order_alert(200)
+        self.assertFalse(self.settings.toggle_order_alert(300))
+        self.assertEqual(service.poll_orders_once(self.store, self.settings, self.api,
+                                                  key=VALID_KEY, fetcher=mock_fetch), 0)
+        def new_sales(key, user_agent=None):
+            return [Order('ORD10001', 'paid'), Order('ORD10002', 'paid', 'Лицензионный ключ')]
+        self.assertEqual(service.poll_orders_once(self.store, self.settings, self.api,
+                                                  key=VALID_KEY, fetcher=new_sales), 1)
+        self.assertEqual([x[0] for x in self.api.sent], [100, 200])
+        self.assertTrue(all('ORD10002' in x[1] for x in self.api.sent))
+        self.assertEqual(service.poll_orders_once(self.store, self.settings, self.api,
+                                                  key=VALID_KEY, fetcher=new_sales), 0)
+        self.assertEqual(len(self.api.sent), 2)
+
+    def test_viewer_cannot_toggle_or_read_orders(self):
+        self.assertIn('🔒', reply_for(self.message(300, '/orders on'), 100, self.plugins,
+                                       self.start, settings=self.settings, orders=self.store))
+        response = callback_for(self.callback(300, 'o:toggle'), 100, self.plugins,
+                                self.start, settings=self.settings, orders=self.store)
+        self.assertIn('🔒', response[0])
+        self.assertFalse(self.settings.monitor_enabled())
+        self.assertIn('🔒', callback_for(self.callback(300, 'a:orders'), 100, self.plugins,
+                                        self.start, settings=self.settings, orders=self.store)[0])
+        self.assertNotIn('m:orders', str(menu('viewer')))
+
+    def test_owner_toggle_by_telegram_and_admin_sees_status(self):
+        text = reply_for(self.message(100, '/orders on'), 100, self.plugins, self.start,
+                         settings=self.settings, orders=self.store)
+        self.assertIn('включён', text)
+        self.assertTrue(self.settings.monitor_enabled())
+        text = reply_for(self.message(200, '/orders'), 100, self.plugins, self.start,
+                         settings=self.settings, orders=self.store)
+        self.assertIn('Заказы', text)
+        self.assertIn('🔒', reply_for(self.message(200, '/orders off'), 100, self.plugins,
+                                       self.start, settings=self.settings, orders=self.store))
+        self.assertTrue(self.settings.monitor_enabled())
+        self.assertFalse(self.settings.toggle_order_alert(300))
+        self.assertTrue(Settings(100, self.d / 'settings.json').monitor_enabled())
+
+    def test_legacy_settings_upgraded_safely(self):
+        data = {'admins': {'200': 'admin'}, 'startup_alerts': [100]}
+        self.settings.filename.write_text(json.dumps(data))
+        reloaded = Settings(100, self.settings.filename)
+        self.assertFalse(reloaded.monitor_enabled())
+        reloaded.set_monitor(True)
+        reloaded.toggle_order_alert(100)
+        again = Settings(100, self.settings.filename)
+        self.assertTrue(again.monitor_enabled())
+        self.assertTrue(again.order_alert_enabled(100))
+        self.assertTrue(again.startup_enabled(100))
+        self.assertEqual(again.role(200), 'admin')
+
+    def test_missing_key_error_does_not_call_network(self):
+        self.settings.set_monitor(True)
+        self.assertEqual(service.poll_orders_once(self.store, self.settings, self.api,
+                                                  key='', fetcher=lambda *a, **kw: 1), 0)
+        self.assertIn('Golden Key', self.store.last_error)
+        self.assertEqual(self.api.sent, [])
+
+
+if __name__ == '__main__':
+    unittest.main()
+
+===== END FILE tests/test_orders_032.py =====
+
+===== BEGIN FILE tests/test_orders_033.py =====
+"""FunPay Rust v0.3.3: durable notifications, 30s poll, search and role checks."""
+import tempfile
+import unittest
+from pathlib import Path
+from datetime import datetime, timezone
+from bot.orders import Order, OrderStore
+from bot.settings import Settings
+from bot.plugins import PluginManager
+from bot.commands import reply_for, callback_for
+from bot import __main__ as service
+
+class FakeAPI:
+    def __init__(self, failures=0):
+        self.failures = failures
+        self.sent = []
+    def send(self, uid, content, markup=None):
+        if self.failures:
+            self.failures -= 1
+            raise service.TelegramError('temporary error')
+        self.sent.append((uid, content, markup))
+
+class TestReliableOrders(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        root = Path(self.temp.name)
+        self.store = OrderStore(root / 'orders.sqlite3')
+        self.settings = Settings(100, root / 'settings.json')
+        self.settings.add(200, 'admin')
+        self.settings.add(300, 'viewer')
+        self.settings.set_monitor(True)
+        self.settings.toggle_order_alert(100)
+        self.settings.toggle_order_alert(200)
+        self.plugins = PluginManager(root / 'plugins')
+        self.started = datetime.now(timezone.utc)
+
+    def message(self, who, command):
+        return {'from': {'id': who}, 'chat': {'id': who, 'type': 'private'},
+                'text': command}
+
+    def cb(self, who, data):
+        return {'from': {'id': who}, 'message': {
+            'chat': {'id': who, 'type': 'private'}, 'message_id': 3}, 'data': data}
+
+    def test_pending_deliveries_survive_restart(self):
+        self.store.record([Order('OLD12345', 'paid')], recipients=[100])
+        self.store.record([Order('NEW12345', 'paid')], recipients=[100, 200])
+        store = OrderStore(self.store.filename)
+        self.assertEqual(len(store.pending_deliveries()), 2)
+        api = FakeAPI(failures=1)
+        service.flush_deliveries(store, self.settings, api)
+        self.assertEqual(len(store.pending_deliveries()), 1)
+        service.flush_deliveries(store, self.settings, api)
+        self.assertEqual(len(store.pending_deliveries()), 0)
+        self.assertEqual(len(api.sent), 2)
+        self.assertTrue(all(x[2]['inline_keyboard'][0][0]['url'].startswith(
+            'https://funpay.com/orders/') for x in api.sent))
+
+    def test_paid_closed_refunded_transitions(self):
+        self.store.record([Order('OLD12345', 'paid')], recipients=[100])
+        self.store.record([Order('OLD12345', 'closed')], recipients=[100])
+        self.assertEqual(self.store.pending_deliveries()[0][2], 'status')
+        api = FakeAPI()
+        service.flush_deliveries(self.store, self.settings, api)
+        self.assertIn('closed', api.sent[0][1])
+        self.store.record([Order('OLD12345', 'refunded')], recipients=[100])
+        self.assertEqual(len(self.store.pending_deliveries()), 1)
+        service.flush_deliveries(self.store, self.settings, api)
+        self.assertEqual(len(api.sent), 2)
+        self.assertIn('refunded', api.sent[1][1])
+
+    def test_disallow_delivery_after_admin_revocation(self):
+        self.store.record([Order('OLD12345', 'paid')], recipients=[200])
+        self.store.record([Order('NEW12345', 'paid')], recipients=[200])
+        self.settings.remove(200)
+        api = FakeAPI()
+        service.flush_deliveries(self.store, self.settings, api)
+        self.assertEqual(api.sent, [])
+        self.assertEqual(self.store.pending_deliveries(), [])
+
+    def test_no_double_alert(self):
+        self.store.record([], recipients=[100])
+        new = Order('NEW12345', 'paid', 'Товар')
+        self.store.record([new], recipients=[100])
+        self.store.record([new], recipients=[100])
+        self.assertEqual(len(self.store.pending_deliveries()), 1)
+
+    def test_history_search_and_no_viewer_access(self):
+        self.store.record([Order('ABCD1234','paid','Ключ','BuyerOne')])
+        self.assertEqual(self.store.find('BuyerOne')[0].order_id, 'ABCD1234')
+        self.assertEqual(self.store.find('ABCD'), self.store.find('Ключ'))
+        self.assertEqual(self.store.find('does_not_exist'), [])
+        output = reply_for(self.message(100,'/findorder buyer'), 100,
+                           self.plugins, self.started, settings=self.settings,
+                           orders=self.store)
+        self.assertIn('ABCD1234', output)
+        viewer = reply_for(self.message(300, '/findorder BuyerOne'), 100,
+                           self.plugins, self.started, settings=self.settings,
+                           orders=self.store)
+        self.assertIn('🔒', viewer)
+
+    def test_testalert_no_purchase_or_network(self):
+        output = reply_for(self.message(100,'/testalert'),100,self.plugins,
+                           self.started,settings=self.settings,orders=self.store)
+        self.assertIn('ТЕСТ', output)
+        self.assertIn('Реальной покупки нет', output)
+        self.assertEqual(self.store.summary()[0], 0)
+        self.assertIn('🔒', reply_for(self.message(300,'/testalert'),100,
+                         self.plugins,self.started,settings=self.settings,orders=self.store))
+
+    def test_poll_guard_limits_requests(self):
+        guard = service.PollGuard(minimum_interval=60)
+        api = FakeAPI()
+        calls = []
+        def fetch(*a, **kw):
+            calls.append(1)
+            return []
+        service.poll_orders_once(self.store, self.settings, api,
+                                 key='A'*32, fetcher=fetch, guard=guard)
+        service.poll_orders_once(self.store, self.settings, api,
+                                 key='A'*32, fetcher=fetch, guard=guard)
+        self.assertEqual(len(calls), 1)
+
+    def test_manual_refresh_and_no_unauthorized_callback(self):
+        polls = []
+        response = callback_for(self.cb(100, 'o:check'), 100, self.plugins,
+                                self.started, settings=self.settings,
+                                orders=self.store, poll_now=lambda: polls.append(1))
+        self.assertEqual(polls, [1])
+        self.assertIn('Заказы', response[0])
+        response = callback_for(self.cb(300, 'o:check'), 100, self.plugins,
+                                self.started, settings=self.settings,
+                                orders=self.store, poll_now=lambda: polls.append(1))
+        self.assertIn('🔒', response[0])
+        self.assertEqual(polls, [1])
+
+if __name__ == '__main__':
+    unittest.main()
+
+===== END FILE tests/test_orders_033.py =====
+
+===== BEGIN FILE tests/test_security_beta.py =====
+import io
+import json
+import os
+from pathlib import Path
+from tempfile import TemporaryDirectory
+import unittest
+from unittest.mock import patch
+from urllib.error import HTTPError, URLError
+
+from bot.checkpoint import CheckpointError, UpdateCheckpoint
+from bot.commands import reply_for, callback_for
+from bot.funpay_probe import ProbeError, status_from_environment, verify
+from bot.plugins import PluginManager, PluginStateError
+
+
+class Response(io.BytesIO):
+    def __init__(self, body, url="https://funpay.com/"):
+        super().__init__(body)
+        self.url = url
+
+    def geturl(self):
+        return self.url
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+
+
+class Opener:
+    def __init__(self, response):
+        self.response = response
+        self.requests = []
+
+    def open(self, req, timeout):
+        self.requests.append(req)
+        if isinstance(self.response, Exception):
+            raise self.response
+        return self.response
+
+
+class TestFunPayProbe(unittest.TestCase):
+    KEY = "a" * 32
+
+    def html(self, user_id=123, username="Tester"):
+        return (f'<html><body data-app-data=\'{{"userId":{user_id}}}\'>'
+                f'<div class="user-link-name">{username}</div></body></html>').encode()
+
+    def test_authorized_read_only(self):
+        mock = Opener(Response(self.html()))
+        text = verify(self.KEY, opener=mock)
+        self.assertIn("авторизация подтверждена", text)
+        self.assertIn("Tester", text)
+        self.assertEqual(mock.requests[0].get_method(), "GET")
+        self.assertEqual(mock.requests[0].full_url, "https://funpay.com/")
+        self.assertIn(self.KEY, mock.requests[0].get_header("Cookie"))
+        self.assertNotIn(self.KEY, text)
+
+    def test_network_client_disables_environment_proxy(self):
+        from urllib import request
+        html = self.html()
+        fake = Opener(Response(html))
+        with patch("bot.funpay_probe.request.build_opener", return_value=fake) as factory:
+            verify(self.KEY)
+        handlers = factory.call_args.args
+        self.assertTrue(any(isinstance(x, request.ProxyHandler) and x.proxies == {}
+                            for x in handlers))
+
+    def test_missing_auth(self):
+        with self.assertRaises(ProbeError):
+            verify(self.KEY, opener=Opener(Response(b"<html>logged out</html>")))
+
+    def test_untrusted_redirect_not_followed(self):
+        mock = Opener(Response(self.html(), url="https://evil.example/"))
+        with self.assertRaises(ProbeError):
+            verify(self.KEY, opener=mock)
+        self.assertEqual(len(mock.requests), 1)
+
+    def test_redirect_status_no_leak(self):
+        err = HTTPError("https://funpay.com/", 302, "redirect", {"Location": "https://evil.example/"}, None)
+        result = status_from_environment({"FUNPAY_GOLDEN_KEY": self.KEY}, opener=Opener(err))
+        self.assertNotIn(self.KEY, result)
+        self.assertIn("перенаправил", result)
+
+    def test_transport_exception_redacted(self):
+        mock = Opener(URLError("https://evil.example/" + self.KEY))
+        result = status_from_environment({"FUNPAY_GOLDEN_KEY": self.KEY}, opener=mock)
+        self.assertNotIn(self.KEY, result)
+
+    def test_invalid_header_rejected(self):
+        with self.assertRaises(ProbeError):
+            verify(self.KEY, user_agent="x\r\nCookie: leaked")
+
+    def test_no_key(self):
+        self.assertIn("локально", status_from_environment({}))
+
+    def test_html_bounded(self):
+        with self.assertRaises(ProbeError):
+            verify(self.KEY, opener=Opener(Response(b"a" * (2 * 1024 * 1024 + 1))))
+
+    def test_429_handled_without_secrets(self):
+        err = HTTPError("https://funpay.com/", 429, "rate limited", {}, None)
+        result = status_from_environment({"FUNPAY_GOLDEN_KEY": self.KEY}, opener=Opener(err))
+        self.assertIn("частоту", result)
+        self.assertNotIn(self.KEY, result)
+
+
+class TestUpdateCheckpoint(unittest.TestCase):
+    def setUp(self):
+        tmp = TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.path = Path(tmp.name) / "offset.json"
+
+    def test_persistent_and_monotonic(self):
+        checkpoint = UpdateCheckpoint(self.path)
+        self.assertEqual(checkpoint.last_id, -1)
+        self.assertTrue(checkpoint.mark(3))
+        self.assertFalse(checkpoint.mark(3))
+        self.assertFalse(checkpoint.mark(2))
+        self.assertEqual(UpdateCheckpoint(self.path).last_id, 3)
+        if os.name == "posix":
+            self.assertEqual(self.path.stat().st_mode & 0o777, 0o600)
+
+    def test_corrupt_file_fails_closed(self):
+        self.path.write_text("oops")
+        with self.assertRaises(CheckpointError):
+            UpdateCheckpoint(self.path)
+
+    def test_symlink_rejected(self):
+        if not hasattr(os, "symlink"):
+            self.skipTest("symlinks unavailable")
+        target = self.path.with_name("elsewhere")
+        target.write_text('{"last_update_id":1}')
+        self.path.symlink_to(target)
+        with self.assertRaises(CheckpointError):
+            UpdateCheckpoint(self.path)
+
+    def test_invalid_id_not_saved(self):
+        checkpoint = UpdateCheckpoint(self.path)
+        self.assertFalse(checkpoint.mark(True))
+        self.assertFalse(self.path.exists())
+
+
+class TestPluginGuard(unittest.TestCase):
+    def setUp(self):
+        tmp = TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.base = self.root / "builtins"
+        self.extra = self.root / "external"
+        self.base.mkdir()
+        self.extra.mkdir()
+        p = self.extra / "bad"
+        p.mkdir()
+        (p / "manifest.json").write_text(json.dumps({
+            "name": "Bad", "command": "bad", "enabled": True
+        }))
+        (p / "plugin.py").write_text("from pathlib import Path\nPath(__file__ + '.executed').write_text('yes')\ndef handle(args): return 'bad'\n")
+        self.marker = p / "plugin.py.executed"
+
+    def test_external_code_not_executed_by_default_policy(self):
+        mgr = PluginManager(self.base, self.extra, allow_external=False)
+        self.assertFalse(self.marker.exists())
+        self.assertNotIn("bad", mgr.commands)
+
+    def test_explicit_opt_in_still_supported(self):
+        mgr = PluginManager(self.base, self.extra, allow_external=True)
+        self.assertIn("bad", mgr.commands)
+        self.assertTrue(self.marker.exists())
+
+    def test_plugin_state_permissions(self):
+        state = self.root / "plugins.json"
+        p = self.base / "demo"
+        p.mkdir()
+        (p / "manifest.json").write_text(json.dumps({
+            "name": "Demo", "command": "demo", "enabled": True
+        }))
+        (p / "plugin.py").write_text("def handle(args): return 'ok'\n")
+        mgr = PluginManager(self.base, state_file=state)
+        self.assertTrue(mgr.set_enabled("demo", False))
+        self.assertFalse(PluginManager(self.base, state_file=state).commands)
+        if os.name == "posix":
+            self.assertEqual(state.stat().st_mode & 0o777, 0o600)
+
+    def test_broken_state_fails_closed(self):
+        state = self.root / "plugins.json"
+        state.write_text("invalid-json", encoding="utf-8")
+        with self.assertRaises(PluginStateError):
+            PluginManager(self.base, self.extra, state_file=state)
+
+    def test_symlink_state_fails_closed(self):
+        if not hasattr(os, "symlink"):
+            self.skipTest("symlinks unavailable")
+        state = self.root / "plugins.json"
+        state.symlink_to(self.root / "missing")
+        with self.assertRaises(PluginStateError):
+            PluginManager(self.base, self.extra, state_file=state)
+
+    def test_external_plugins_require_explicit_opt_in(self):
+        mgr = PluginManager(self.base, self.extra)
+        self.assertFalse(self.marker.exists())
+        self.assertNotIn("bad", mgr.commands)
+
+    def test_plugin_cannot_shadow_funpay_command(self):
+        p = self.base / "shadow"
+        p.mkdir()
+        (p / "manifest.json").write_text(json.dumps({
+            "name": "Shadow", "command": "funpay", "enabled": True
+        }))
+        (p / "plugin.py").write_text("def handle(args): return 'evil'\n")
+        mgr = PluginManager(self.base)
+        self.assertNotIn("funpay", mgr.commands)
+
+
+class TestCommandsSecurity(unittest.TestCase):
+    def setUp(self):
+        tmp = TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.plugins = PluginManager(Path(tmp.name))
+        from datetime import datetime, timezone
+        self.started = datetime.now(timezone.utc)
+
+    def test_only_admin_can_probe(self):
+        called = []
+        probe = lambda: called.append(1) or "OK"
+        unauthorized = {"from": {"id": 8}, "chat": {"id": 8, "type": "private"}, "text": "/funpay"}
+        self.assertIsNone(reply_for(unauthorized, 7, self.plugins, self.started, probe))
+        self.assertEqual(called, [])
+        authorized = {"from": {"id": 7}, "chat": {"id": 7, "type": "private"}, "text": "/funpay"}
+        self.assertEqual(reply_for(authorized, 7, self.plugins, self.started, probe), "OK")
+        self.assertEqual(called, [1])
+
+    def test_group_callback_forbidden(self):
+        callback = {"from": {"id": 7}, "message": {"chat": {"id": -70, "type": "group"}}, "data": "m:funpay"}
+        self.assertIsNone(callback_for(callback, 7, self.plugins, self.started, lambda: "OK"))
+
+===== END FILE tests/test_security_beta.py =====
+
+===== BEGIN FILE tests/test_transport.py =====
+import unittest
+from urllib.error import HTTPError
+from unittest.mock import patch
+from bot.telegram_api import TelegramAPI, TelegramError
+
+class TestTransport(unittest.TestCase):
+    def test_http_error_does_not_expose_token(self):
+        token = "123456:" + "B" * 35
+        api = TelegramAPI(token)
+        with patch("bot.telegram_api.request.urlopen", side_effect=HTTPError("https://example.com/"+token, 401, "unauthorized", None, None)):
+            with self.assertRaises(TelegramError) as ctx:
+                api.call("getMe")
+        self.assertNotIn(token, str(ctx.exception))
+
+===== END FILE tests/test_transport.py =====
