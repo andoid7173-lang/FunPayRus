@@ -64,7 +64,11 @@ def flush_deliveries(store, settings, api, limit=30):
         return 0
     for event_id, uid, kind, previous_status, order in entries:
         if settings.role(uid) not in ('owner', 'admin') or not settings.order_alert_enabled(uid):
-            store.mark_delivered(event_id)
+            try:
+                store.mark_delivered(event_id)
+            except OrderMonitorError:
+                LOG.warning('Не удалось сохранить отзыв подписки; повторим позднее')
+                return sent
             continue
         button = order_button(order.order_id)
         markup = {'inline_keyboard': [[button]]} if button else None
@@ -78,7 +82,11 @@ def flush_deliveries(store, settings, api, limit=30):
         except TelegramError:
             LOG.warning('Уведомление о заказе не доставлено; повторим позднее')
             continue
-        store.mark_delivered(event_id)
+        try:
+            store.mark_delivered(event_id)
+        except OrderMonitorError:
+            LOG.warning('Не удалось подтвердить доставку; возможен повтор после восстановления БД')
+            return sent
         sent += 1
     return sent
 
