@@ -32,14 +32,14 @@ class PollGuard:
 
     def __init__(self, minimum_interval=20):
         self.lock = threading.Lock()
-        self.last_started = 0.0
+        self.last_started = None
         self.minimum_interval = minimum_interval
 
     def enter(self):
         if not self.lock.acquire(blocking=False):
             return False
         now = time.monotonic()
-        if now - self.last_started < self.minimum_interval:
+        if self.last_started is not None and now - self.last_started < self.minimum_interval:
             self.lock.release()
             return False
         self.last_started = now
