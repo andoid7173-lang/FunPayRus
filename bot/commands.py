@@ -1,5 +1,6 @@
 """Private Telegram interface with owner/admin/viewer access boundaries."""
 from datetime import datetime, timezone
+import os
 import re
 
 from bot import __version__
@@ -10,6 +11,8 @@ from bot.orders import OrderMonitorError, order_button
 from bot.stock import StockError, StockStore
 from bot.operator import OperatorError, OperatorStore
 from bot.mail_events import MailEventError, MailEventStore
+from bot.mail_service import MailService, MailServiceError, ALERT_TEMPLATE
+from bot.mail_auth import MailAuthError, connected as mail_connected
 
 _ID = re.compile(r'^[1-9][0-9]{0,18}$')
 
@@ -189,13 +192,15 @@ def platform_screen(orders):
     except MailEventError:
         return 'Центр платформ: не удалось прочитать журнал.'
     lines = ['✉️ Центр уведомлений платформ — подготовлен',
-             'Outlook, Gmail и другие источники: ещё НЕ подключены.',
+             'Outlook: /mailstatus (необязательное подключение на своём VPS).',
+             'Gmail и другие почтовые провайдеры: пока НЕ подключены.',
              'Нужны отдельные OAuth-адаптеры с правами только на метаданные.',
              f'Сохранено безопасных событий: {total}']
     for provider, platform, kind, count in rows[:10]:
         lines.append(f'{platform} / {provider}: {kind} × {count}')
     lines.extend(['', 'Steam Guard-коды, пароли, токены и тексты писем здесь не хранятся.',
-                  'Письма не читаются автоматически. Никаких действий со Steam нет.'])
+                  'Без собственного OAuth и /mailalerts on почта не проверяется.',
+                  'Действий со Steam и другими аккаунтами нет.'])
     return '\n'.join(lines)[:3500]
 
 
@@ -330,6 +335,9 @@ def reply_for(message, admin_id, plugins, started_at,
                    '/stats — сводка локальных наблюдений\n'
                    '/lowstock — контроль остатков\n'
                    '/platforms — центр платформ\n'
+                   '/mailstatus — безопасный статус Outlook\n'
+                   '/mailalerts on|off — мониторинг почты\n'
+                   '/mailconnect — инструкция OAuth на VPS\n'
                    '/note — заметка по заказу\n' if role == 'owner' else '')
                 + ('/admins — управление доступом\n/plugins — плагины\n' if role == 'owner' else '')
                 + '\n⚠️ Автовыдача и отправка сообщений покупателям отключены.')
@@ -372,6 +380,58 @@ def reply_for(message, admin_id, plugins, started_at,
                 + '\\n\\n'.join(
                     f'#{x.order_id}: {x.status} — {x.description[:70]}'
                     for x in matches))
+    if command in ('mailstatus', 'mailalerts', 'mailconnect', 'maildisconnect', 'mailtest'):
+        if role != 'owner':
+            return '🔒 Почтой может управлять только владелец.'
+        if orders is None:
+            return 'Локальная база пока недоступна.'
+        client_id = os.environ.get('MAIL_CLIENT_ID', '').strip()
+        if command == 'mailconnect':
+            return ('Подключение Outlook выполняется владельцем ТОЛЬКО в SSH-терминале VPS.\n'
+                    'cd /opt/funpayrus\n'
+                    'sudo -u funpayrus /opt/funpayrus/.venv/bin/python -m bot.mail_auth connect\n'
+                    'Не отправляй OAuth-код или токены в Telegram. '
+                    'После авторизации: /mailalerts on.')
+        if command == 'mailtest':
+            return ('ТЕСТ: Steam — обнаружено уведомление в Outlook. '
+                    'Проверяй события самостоятельно. Реальной проверки почты не было.')
+        if not client_id:
+            return 'Outlook не настроен. Сначала прочитай README и запусти setup_outlook.sh на VPS.'
+        try:
+            monitor = MailService(orders.filename)
+            if command == 'mailstatus':
+                state = monitor.status()
+                try:
+                    cache_present = mail_connected(client_id)
+                except MailAuthError:
+                    cache_present = False
+                return ('✉️ Outlook\n'
+                        + ('Кэш авторизации существует.' if cache_present else 'Авторизация не настроена.')
+                        + '\nМониторинг: ' + ('включён' if state['enabled'] else 'выключен')
+                        + f'\nОчередь уведомлений: {state["pending"]}'
+                        + '\nНе показывает email, токены, темы или коды.')
+            if command == 'maildisconnect':
+                monitor.disable()
+                return ('Мониторинг отключён. Для удаления локальных OAuth-токенов '
+                        'выполни в SSH:\n'
+                        'sudo -u funpayrus /opt/funpayrus/.venv/bin/python '
+                        '-m bot.mail_auth disconnect\n'
+                        'Затем отзови согласие приложения в настройках Microsoft.')
+            if command == 'mailalerts':
+                if args.strip() == 'on':
+                    try:
+                        if not mail_connected(client_id):
+                            return 'Сначала авторизуй Outlook через SSH: /mailconnect.'
+                    except MailAuthError:
+                        return 'Не удаётся прочитать OAuth-кэш. Проверь настройки на VPS.'
+                    monitor.enable()
+                    return 'Мониторинг Outlook включён. Содержимое писем и коды не читаются.'
+                if args.strip() == 'off':
+                    monitor.disable()
+                    return 'Мониторинг Outlook отключён; ожидавшие уведомления сброшены.'
+                return 'Используй /mailalerts on или /mailalerts off.'
+        except (MailServiceError, OSError):
+            return 'Центр почты не настроен или его данные недоступны.'
     if command in ('stats', 'lowstock', 'platforms', 'note'):
         if role != 'owner':
             return '🔒 Только владелец может использовать эту команду.'
@@ -537,7 +597,7 @@ def keyboard_for_command(text, plugins, settings=None, user_id=None, owner_id=No
         return {'inline_keyboard': [[b] for b in (
             order_button(o.order_id) for o in orders.find(text.partition(' ')[2])
         ) if b] + [[{'text': '⬅️ Назад', 'callback_data': 'm:orders'}]]}
-    if command in ('/stats', '/lowstock', '/platforms'):
+    if command in ('/stats', '/lowstock', '/platforms', '/mailstatus', '/mailalerts', '/mailconnect'):
         return {'inline_keyboard': [[{'text': '🏠 Главное меню', 'callback_data': 'm:home'}]]}
     return menu(role_for(user_id, owner_id, settings))
 
