@@ -1,2 +1,2 @@
 """FunPay Rust Telegram admin bot."""
-__version__ = "0.3.5b1"
+__version__ = "0.3.6b1"
