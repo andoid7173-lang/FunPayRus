@@ -414,7 +414,7 @@ def reply_for(message, admin_id, plugins, started_at,
                         return 'Используй /note clear ID для удаления.'
                     outcome = db.set_note(pieces[0], value, uid)
                     return {'saved': 'Заметка сохранена только в локальной базе.',
-                            'missing': 'Сначала дождись появления заказа в истории.',
+                            'missing': 'Заказ не найден в локальной истории.',
                             'invalid': 'Неверный номер заказа или текст заметки.'}[outcome]
             except OperatorError:
                 return 'Ошибка сохранения заметки.'
