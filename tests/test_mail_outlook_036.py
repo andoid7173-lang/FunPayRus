@@ -99,6 +99,7 @@ class TestMailService(unittest.TestCase):
 
     def test_outbox_duplicate_and_retry(self):
         self.svc.poll('client', fetcher=lambda *_: self.fail('first'))
+        self.now += 2
         event = ('opaque-secret-id', self.now, 'steam')
         with patch('bot.mail_service.access_token', return_value='local-token'):
             self.assertEqual(self.svc.poll(
@@ -117,6 +118,19 @@ class TestMailService(unittest.TestCase):
         self.assertEqual(len(messages), 1)
         self.assertIn('Steam', messages[0])
         self.assertNotIn('opaque-secret-id', messages[0])
+
+    def test_old_mail_before_initialization_is_not_sent(self):
+        self.svc.poll('client')
+        self.now += 120
+        with patch('bot.mail_service.access_token', return_value='local-token'):
+            self.assertEqual(self.svc.poll(
+                'client', fetcher=lambda token, since: [
+                    ('old-1', self.now - 121, 'steam'),
+                    ('new-1', self.now, 'steam')]), 'ok')
+        messages = []
+        self.svc.flush(messages.append)
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(self.svc.status()['pending'], 0)
 
     def test_truncated_page_never_advances_state(self):
         self.svc.poll('client')
