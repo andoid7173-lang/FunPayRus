@@ -1,0 +1,4 @@
+# Optional dependencies only for Outlook metadata monitoring.
+msal>=1.33,<2
+cryptography>=44,<47
+requests>=2.32,<3
