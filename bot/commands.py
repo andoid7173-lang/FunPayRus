@@ -366,6 +366,8 @@ def reply_for(message, admin_id, plugins, started_at,
                         + review_screen(settings, orders))
             if state == 'done':
                 return 'Заказ уже отмечен как обработанный; повтор не требуется.'
+            if state == 'reserved':
+                return 'Для заказа зарезервирован товар. После ручной передачи используй /stock issue ID.'
             if state == 'blocked':
                 return 'Обработка заблокирована: заказ изменил статус или уже отменён.'
             return 'Заказ не найден в очереди или номер некорректен.'
