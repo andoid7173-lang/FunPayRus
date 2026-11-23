@@ -121,11 +121,28 @@ def generate_key(path=KEY_FILE):
         os.fsync(fp.fileno())
 
 
+def configured_client_id():
+    """Read the public app ID from the protected service environment file."""
+    val = os.environ.get("MAIL_CLIENT_ID", "")
+    if val:
+        return val
+    path = Path("/etc/funpayrus/bot.env")
+    if path.is_symlink() or not path.is_file():
+        return ""
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if line.startswith("MAIL_CLIENT_ID="):
+                return line.split("=", 1)[1].strip()
+    except OSError:
+        return ""
+    return ""
+
+
 def cli(argv=None):
     import argparse
     parser = argparse.ArgumentParser(description="Outlook OAuth только в SSH-терминале")
     parser.add_argument("action", choices=("connect", "disconnect", "status"))
-    parser.add_argument("--client-id", default=os.environ.get("MAIL_CLIENT_ID", ""))
+    parser.add_argument("--client-id", default=configured_client_id())
     parser.add_argument("--state-dir", default=str(STATE_DIR))
     parser.add_argument("--key-file", default=str(KEY_FILE))
     args = parser.parse_args(argv)
