@@ -10,6 +10,8 @@ import sqlite3
 import time
 from contextlib import contextmanager
 
+from bot.order_audit import create_schema, append_action
+
 SKU_RE = re.compile(r'^[A-Z0-9][A-Z0-9_-]{1,39}$')
 ORDER_RE = re.compile(r'^[A-Za-z0-9_-]{4,64}$')
 
@@ -34,6 +36,7 @@ class StockStore:
                            'created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)')
                 db.execute('CREATE INDEX IF NOT EXISTS stock_by_sku '
                            'ON stock_items(sku,state,id)')
+                create_schema(db)
         except (sqlite3.Error, OSError):
             raise StockError('Не удалось подготовить локальный склад') from None
 
@@ -129,6 +132,10 @@ class StockStore:
                 return 'missing'
             if candidate != ('pending', 'paid'):
                 return 'blocked'
+            verified = db.execute('SELECT 1 FROM manual_verifications WHERE order_id=?',
+                                  (order_id,)).fetchone()
+            if not verified:
+                return 'unverified'
             item = db.execute(
                 "SELECT id FROM stock_items WHERE sku=? AND state='available' "
                 'ORDER BY id ASC LIMIT 1', (sku,)
@@ -140,6 +147,7 @@ class StockStore:
                 "WHERE id=? AND state='available'",
                 (order_id, int(time.time()), item[0])
             )
+            append_action(db, order_id, 'reserved')
         return 'reserved'
 
     def secret_for_local_terminal(self, order_id):
@@ -188,6 +196,7 @@ class StockStore:
                 "WHERE order_id=? AND state='pending'",
                 (owner_id, now, order_id)
             )
+            append_action(db, order_id, 'issued', owner_id)
         return 'done'
 
     def void(self, order_id):
@@ -211,4 +220,5 @@ class StockStore:
                 "order_id=? AND state='reserved'",
                 (int(time.time()), order_id)
             )
+            append_action(db, order_id, 'void')
         return 'void'
