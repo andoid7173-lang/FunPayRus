@@ -7,6 +7,7 @@ from bot.diagnostics import demo_screen, report, setup_summary
 from bot.funpay_probe import status_from_environment
 from bot.settings import SettingsError
 from bot.orders import OrderMonitorError, order_button
+from bot.stock import StockError, StockStore
 
 _ID = re.compile(r'^[1-9][0-9]{0,18}$')
 
@@ -38,6 +39,7 @@ def menu(role='owner'):
         rows.append([{'text': '📦 Заказы (тест)', 'callback_data': 'm:orders'},
                      {'text': '🗂 Очередь проверки', 'callback_data': 'm:queue'}])
     if role == 'owner':
+        rows.append([{'text': '📚 Склад', 'callback_data': 'm:stock'}])
         rows.append([{'text': '👥 Администраторы', 'callback_data': 'm:admins'},
                      {'text': '🧩 Плагины', 'callback_data': 'm:plugins'}])
     rows.append([{'text': '🏓 Связь', 'callback_data': 'm:ping'},
@@ -150,6 +152,28 @@ def review_menu(settings, uid, orders):
     return {'inline_keyboard': rows}
 
 
+def stock_screen(orders):
+    if orders is None:
+        return 'Склад недоступен.'
+    try:
+        stock = StockStore(orders.filename)
+        data = stock.summary()
+    except StockError:
+        return 'Ошибка локального склада. Проверь /diagnostics.'
+    lines = ['📚 Локальный склад цифровых товаров (только учёт)']
+    for sku, states in sorted(data.items())[:30]:
+        lines.append(f'{sku}: доступно {states["available"]}, резерв {states["reserved"]}, '
+                     f'выдано {states["issued"]}, списано {states["void"]}')
+    if not data:
+        lines.append('Склад пуст. Добавь товары через SSH; не в Telegram.')
+    lines.extend(['', '/stock reserve ID SKU — зарезервировать код после ручной проверки оплаты',
+                  '/stock issue ID — отметить самостоятельную выдачу покупателю',
+                  '/stock void ID — окончательно списать резерв',
+                  'Код товара бот никогда не показывает в Telegram.',
+                  'SSH: sudo -u funpayrus python3 -m bot.stock_cli add SKU'])
+    return '\n'.join(lines)[:3800]
+
+
 def plugin_menu(plugins):
     rows = [[{'text': ('✅ ' if enabled else '⚪ ') + info.name,
               'callback_data': 'p:toggle:' + info.command}]
@@ -234,6 +258,7 @@ def reply_for(message, admin_id, plugins, started_at,
                 '/setup — мастер настройки\n/funpay — тест соединения\n'
                 + ('/orders — мониторинг продаж (только чтение)\n'
                    '/queue — ручная проверка и учёт выполнения\n' if role in ('owner', 'admin') else '')
+                + ('/stock — склад и резервирование кодов\n' if role == 'owner' else '')
                 + ('/admins — управление доступом\n/plugins — плагины\n' if role == 'owner' else '')
                 + '\n⚠️ Автовыдача и отправка сообщений покупателям отключены.')
     if command == 'status':
@@ -275,6 +300,51 @@ def reply_for(message, admin_id, plugins, started_at,
                 + '\\n\\n'.join(
                     f'#{x.order_id}: {x.status} — {x.description[:70]}'
                     for x in matches))
+    if command == 'stock':
+        if role != 'owner':
+            return '🔒 Только владелец управляет складом.'
+        if orders is None:
+            return 'Склад недоступен.'
+        pieces = args.strip().split()
+        if not pieces:
+            return stock_screen(orders)
+        try:
+            stock = StockStore(orders.filename)
+            if len(pieces) == 3 and pieces[0] == 'reserve':
+                outcome = stock.reserve(pieces[1], pieces[2])
+                msgs = {
+                    'reserved': 'Код зарезервирован на VPS. В Telegram он не выводится. '
+                                'Проверь заказ и получи код в SSH: '
+                                'sudo -u funpayrus python3 -m bot.stock_cli show ID',
+                    'already': 'Этот заказ уже зарезервирован; повторной выдачи нет.',
+                    'conflict': 'Заказ уже связан с другим SKU.',
+                    'missing': 'Нет заказа в очереди проверки.',
+                    'blocked': 'Заказ заблокирован или не имеет статуса paid.',
+                    'empty': 'На складе нет доступных кодов для этого SKU.',
+                    'invalid': 'Некорректный номер заказа или SKU.'
+                }
+                return msgs.get(outcome, 'Неизвестное состояние.') + '\n' + stock_screen(orders)
+            if len(pieces) == 2 and pieces[0] == 'issue':
+                outcome = stock.complete(pieces[1], uid)
+                return {
+                    'done': 'Выдача отмечена в локальной базе. Покупателю ничего не отправлено.',
+                    'already': 'Товар уже отмечен выданным.',
+                    'missing': 'Резерв для заказа не найден.',
+                    'blocked': 'Статус изменён или обработка запрещена.',
+                    'invalid': 'Некорректный номер заказа.'
+                }[outcome]
+            if len(pieces) == 2 and pieces[0] == 'void':
+                outcome = stock.void(pieces[1])
+                return {
+                    'void': 'Резерв списан. Код больше не попадёт в другие заказы.',
+                    'already': 'Резерв уже списан.',
+                    'missing': 'Резерв не найден.',
+                    'blocked': 'Списать можно только резерв, не выданный товар.',
+                    'invalid': 'Некорректный номер заказа.'
+                }[outcome]
+        except StockError:
+            return 'Не удалось безопасно прочитать или изменить склад.'
+        return 'Используй: /stock | /stock reserve ID SKU | /stock issue ID | /stock void ID'
     if command == 'queue':
         if role not in ('owner', 'admin'):
             return '🔒 Очередь доступна только администраторам.'
@@ -340,6 +410,9 @@ def keyboard_for_command(text, plugins, settings=None, user_id=None, owner_id=No
         return orders_menu(settings, user_id, orders)
     if command == '/queue':
         return review_menu(settings, user_id, orders)
+    if command == '/stock':
+        return {'inline_keyboard': [[{'text': '🗂 Очередь', 'callback_data': 'm:queue'}],
+                                    [{'text': '🏠 Главное меню', 'callback_data': 'm:home'}]]}
     if command == '/findorder' and orders and settings and settings.role(user_id) in ('owner', 'admin'):
         return {'inline_keyboard': [[b] for b in (
             order_button(o.order_id) for o in orders.find(text.partition(' ')[2])
@@ -360,7 +433,7 @@ def callback_for(callback, admin_id, plugins, started_at,
                 'm:plugins': '/plugins', 'm:diagnostics': '/diagnostics',
                 'm:setup': '/setup', 'm:demo': '/demo',
                 'm:notifications': '/notifications', 'm:admins': '/admins',
-                'm:orders': '/orders', 'm:queue': '/queue'}
+                'm:orders': '/orders', 'm:queue': '/queue', 'm:stock': '/stock'}
     if data in sections:
         command = sections[data]
         output = reply_for({**check, 'text': command}, admin_id, plugins, started_at,
