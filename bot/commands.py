@@ -8,6 +8,8 @@ from bot.funpay_probe import status_from_environment
 from bot.settings import SettingsError
 from bot.orders import OrderMonitorError, order_button
 from bot.stock import StockError, StockStore
+from bot.operator import OperatorError, OperatorStore
+from bot.mail_events import MailEventError, MailEventStore
 
 _ID = re.compile(r'^[1-9][0-9]{0,18}$')
 
@@ -39,7 +41,10 @@ def menu(role='owner'):
         rows.append([{'text': '📦 Заказы (тест)', 'callback_data': 'm:orders'},
                      {'text': '🗂 Очередь проверки', 'callback_data': 'm:queue'}])
     if role == 'owner':
-        rows.append([{'text': '📚 Склад', 'callback_data': 'm:stock'}])
+        rows.append([{'text': '📚 Склад', 'callback_data': 'm:stock'},
+                     {'text': '📈 Сводка', 'callback_data': 'm:stats'}])
+        rows.append([{'text': '🔔 Остатки', 'callback_data': 'm:lowstock'},
+                     {'text': '✉️ Платформы', 'callback_data': 'm:platforms'}])
         rows.append([{'text': '👥 Администраторы', 'callback_data': 'm:admins'},
                      {'text': '🧩 Плагины', 'callback_data': 'm:plugins'}])
     rows.append([{'text': '🏓 Связь', 'callback_data': 'm:ping'},
@@ -174,6 +179,69 @@ def stock_screen(orders):
     return '\n'.join(lines)[:3800]
 
 
+
+def platform_screen(orders):
+    """Only safe aggregate metadata; no emails, subjects or login codes."""
+    if orders is None:
+        return 'Центр платформ недоступен.'
+    try:
+        total, rows = MailEventStore(orders.filename).summary()
+    except MailEventError:
+        return 'Центр платформ: не удалось прочитать журнал.'
+    lines = ['✉️ Центр уведомлений платформ — подготовлен',
+             'Outlook, Gmail и другие источники: ещё НЕ подключены.',
+             'Нужны отдельные OAuth-адаптеры с правами только на метаданные.',
+             f'Сохранено безопасных событий: {total}']
+    for provider, platform, kind, count in rows[:10]:
+        lines.append(f'{platform} / {provider}: {kind} × {count}')
+    lines.extend(['', 'Steam Guard-коды, пароли, токены и тексты писем здесь не хранятся.',
+                  'Письма не читаются автоматически. Никаких действий со Steam нет.'])
+    return '\n'.join(lines)[:3500]
+
+
+def stats_screen(orders):
+    if orders is None:
+        return 'Сводка недоступна.'
+    try:
+        data = OperatorStore(orders.filename).stats()
+    except OperatorError:
+        return 'Не удалось составить локальную сводку.'
+    last = data['last_poll']
+    timestamp = (datetime.fromtimestamp(last, timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
+                 if last else 'ещё не было')
+    return ('📈 Сводка локальных наблюдений\n'
+            f'Заказы: paid={data["orders"].get("paid", 0)}, '
+            f'closed={data["orders"].get("closed", 0)}, '
+            f'refunded={data["orders"].get("refunded", 0)}\n'
+            f'Проверка: ожидают={data["reviews"].get("pending", 0)}, '
+            f'выполнено={data["reviews"].get("done", 0)}, '
+            f'заблокировано={data["reviews"].get("blocked", 0)}\n'
+            f'Склад: доступно={data["stock"].get("available", 0)}, '
+            f'резерв={data["stock"].get("reserved", 0)}, '
+            f'выдано={data["stock"].get("issued", 0)}\n'
+            f'Непереданных Telegram-уведомлений: {data["undelivered_alerts"]}\n'
+            f'Локальных заметок: {data["notes"]}\n'
+            f'Последний опрос: {timestamp}\n\n'
+            'Это НЕ отчёт о продажах или доходе: статус paid получен из HTML.')
+
+
+def lowstock_screen(orders):
+    if orders is None:
+        return 'Контроль остатков недоступен.'
+    try:
+        rows = OperatorStore(orders.filename).low_stock()
+    except OperatorError:
+        return 'Не удалось прочитать остатки.'
+    if not rows:
+        return ('🔔 Порог остатков: сейчас нет товаров ниже порога.\n'
+                'По умолчанию порог — 3; /lowstock set SKU ЧИСЛО меняет его.')
+    lines = ['🔔 Товары с низким остатком (или на границе порога):']
+    for sku, available, threshold in rows[:30]:
+        lines.append(f'{sku}: {available} шт. (порог ≤ {threshold})')
+    lines.append('Изменить порог: /lowstock set SKU ЧИСЛО')
+    return '\n'.join(lines)[:3500]
+
+
 def plugin_menu(plugins):
     rows = [[{'text': ('✅ ' if enabled else '⚪ ') + info.name,
               'callback_data': 'p:toggle:' + info.command}]
@@ -258,7 +326,11 @@ def reply_for(message, admin_id, plugins, started_at,
                 '/setup — мастер настройки\n/funpay — тест соединения\n'
                 + ('/orders — мониторинг продаж (только чтение)\n'
                    '/queue — ручная проверка и учёт выполнения\n' if role in ('owner', 'admin') else '')
-                + ('/stock — склад и резервирование кодов\n' if role == 'owner' else '')
+                + ('/stock — склад и резервирование кодов\n'
+                   '/stats — сводка локальных наблюдений\n'
+                   '/lowstock — контроль остатков\n'
+                   '/platforms — центр платформ\n'
+                   '/note — заметка по заказу\n' if role == 'owner' else '')
                 + ('/admins — управление доступом\n/plugins — плагины\n' if role == 'owner' else '')
                 + '\n⚠️ Автовыдача и отправка сообщений покупателям отключены.')
     if command == 'status':
@@ -300,6 +372,52 @@ def reply_for(message, admin_id, plugins, started_at,
                 + '\\n\\n'.join(
                     f'#{x.order_id}: {x.status} — {x.description[:70]}'
                     for x in matches))
+    if command in ('stats', 'lowstock', 'platforms', 'note'):
+        if role != 'owner':
+            return '🔒 Только владелец может использовать эту команду.'
+        if orders is None:
+            return 'Хранилище не настроено.'
+        if command == 'stats':
+            return stats_screen(orders)
+        if command == 'platforms':
+            return platform_screen(orders)
+        if command == 'lowstock':
+            parts = args.strip().split()
+            if parts:
+                if len(parts) != 3 or parts[0] != 'set' or not parts[2].isascii() or not parts[2].isdecimal():
+                    return 'Используй: /lowstock или /lowstock set SKU ЧИСЛО'
+                try:
+                    outcome = OperatorStore(orders.filename).set_threshold(
+                        parts[1], int(parts[2]))
+                except OperatorError:
+                    return 'Не удалось сохранить порог остатков.'
+                return {'saved': 'Порог обновлён.\n', 'missing': 'Товар не найден.\n',
+                        'invalid': 'Неверный SKU или порог.\n'}[outcome] + lowstock_screen(orders)
+            return lowstock_screen(orders)
+        if command == 'note':
+            pieces = args.strip().split(maxsplit=2)
+            if not pieces:
+                return ('Заметки только для владельца. /note ID — посмотреть; '
+                        '/note ID текст — сохранить; /note clear ID — удалить.\n'
+                        'Не записывай сюда пароли, ключи, email или Steam Guard-коды.')
+            try:
+                db = OperatorStore(orders.filename)
+                if len(pieces) == 2 and pieces[0] == 'clear':
+                    return {'cleared': 'Заметка удалена.', 'missing': 'Заметка не найдена.',
+                            'invalid': 'Некорректный номер заказа.'}[db.clear_note(pieces[1])]
+                if len(pieces) == 1:
+                    note = db.note(pieces[0])
+                    return ('Заметка: ' + note) if note else 'Заметка не найдена.'
+                if len(pieces) >= 2:
+                    value = args.strip().split(maxsplit=1)[1]
+                    if value.lower().startswith('clear '):
+                        return 'Используй /note clear ID для удаления.'
+                    outcome = db.set_note(pieces[0], value, uid)
+                    return {'saved': 'Заметка сохранена только в локальной базе.',
+                            'missing': 'Заказ не найден в локальной истории.',
+                            'invalid': 'Неверный номер заказа или текст заметки.'}[outcome]
+            except OperatorError:
+                return 'Ошибка сохранения заметки.'
     if command == 'stock':
         if role != 'owner':
             return '🔒 Только владелец управляет складом.'
@@ -419,6 +537,8 @@ def keyboard_for_command(text, plugins, settings=None, user_id=None, owner_id=No
         return {'inline_keyboard': [[b] for b in (
             order_button(o.order_id) for o in orders.find(text.partition(' ')[2])
         ) if b] + [[{'text': '⬅️ Назад', 'callback_data': 'm:orders'}]]}
+    if command in ('/stats', '/lowstock', '/platforms'):
+        return {'inline_keyboard': [[{'text': '🏠 Главное меню', 'callback_data': 'm:home'}]]}
     return menu(role_for(user_id, owner_id, settings))
 
 
@@ -435,7 +555,9 @@ def callback_for(callback, admin_id, plugins, started_at,
                 'm:plugins': '/plugins', 'm:diagnostics': '/diagnostics',
                 'm:setup': '/setup', 'm:demo': '/demo',
                 'm:notifications': '/notifications', 'm:admins': '/admins',
-                'm:orders': '/orders', 'm:queue': '/queue', 'm:stock': '/stock'}
+                'm:orders': '/orders', 'm:queue': '/queue', 'm:stock': '/stock',
+                 'm:stats': '/stats', 'm:lowstock': '/lowstock',
+                 'm:platforms': '/platforms'}
     if data in sections:
         command = sections[data]
         output = reply_for({**check, 'text': command}, admin_id, plugins, started_at,
