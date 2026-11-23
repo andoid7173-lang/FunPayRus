@@ -151,6 +151,36 @@ def monitor_orders(store, settings, api, stop_event, guard=None):
         stop_event.wait(delay)
 
 
+def monitor_outlook(orders, settings, api, stop_event):
+    """Optional metadata-only Outlook monitor; never blocks the Telegram loop."""
+    client_id = os.environ.get('MAIL_CLIENT_ID', '').strip()
+    if not client_id:
+        return
+    from bot.mail_service import MailService, MailServiceError
+    from bot.mail_auth import MailAuthError
+    try:
+        monitor = MailService(orders.filename)
+    except MailServiceError:
+        LOG.warning('Outlook не запущен: настрой защищённое хранилище почты')
+        return
+    failures = 0
+    while not stop_event.is_set():
+        try:
+            if monitor.is_enabled():
+                result = monitor.poll(client_id)
+                if result in ('ok', 'initialized'):
+                    monitor.flush(lambda msg: api.send(settings.owner_id, msg))
+                failures = 0
+                if result == 'not-connected':
+                    failures = 1
+            else:
+                failures = 0
+        except (MailServiceError, MailAuthError, TelegramError, OSError, ValueError):
+            failures = min(failures + 1, 5)
+            LOG.warning('Outlook: недоступна проверка или отправка (детали скрыты)')
+        stop_event.wait(120 if not failures else min(120 * (2 ** (failures - 1)), 1800))
+
+
 def main():
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
     signal.signal(signal.SIGTERM, stop)
@@ -195,6 +225,10 @@ def main():
         return poll_orders_once(orders, settings, api, guard=poll_guard)
     threading.Thread(target=monitor_orders, args=(orders, settings, api, stop_event, poll_guard),
                      name='funpay-orders-readonly', daemon=True).start()
+    if os.environ.get('MAIL_CLIENT_ID'):
+        threading.Thread(target=monitor_outlook,
+                         args=(orders, settings, api, stop_event),
+                         name='outlook-metadata-monitor', daemon=True).start()
     started_at = datetime.now(timezone.utc)
     while RUNNING:
         try:
