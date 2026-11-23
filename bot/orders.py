@@ -317,6 +317,14 @@ class OrderStore:
                 if row is None:
                     return 'missing'
                 state, order_status = row
+                # A reserved code must be finalized via /stock issue, never /queue done.
+                has_stock = db.execute("SELECT name FROM sqlite_master WHERE "
+                                       "type='table' AND name='stock_items'").fetchone()
+                if has_stock:
+                    stock = db.execute('SELECT state FROM stock_items WHERE order_id=?',
+                                       (order_id,)).fetchone()
+                    if stock and stock[0] == 'reserved':
+                        return 'reserved'
                 if state == 'done':
                     return 'done'
                 if state != 'pending' or order_status != 'paid':
