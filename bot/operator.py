@@ -10,6 +10,8 @@ import sqlite3
 import time
 from contextlib import contextmanager
 
+from bot.stock import StockStore, StockError
+
 _ORDER_ID = re.compile(r'^[A-Za-z0-9_-]{4,64}$')
 _SKU = re.compile(r'^[A-Z0-9][A-Z0-9_-]{1,39}$')
 
@@ -24,6 +26,7 @@ class OperatorStore:
         if self.filename.is_symlink() or not self.filename.is_file():
             raise OperatorError('Хранилище не найдено или путь небезопасен')
         try:
+            StockStore(self.filename)  # Initialize optional inventory schema on older VPS data.
             with self.connect() as db:
                 db.execute('CREATE TABLE IF NOT EXISTS operator_notes ('
                            'order_id TEXT PRIMARY KEY, note TEXT NOT NULL, '
@@ -31,7 +34,7 @@ class OperatorStore:
                 db.execute('CREATE TABLE IF NOT EXISTS stock_thresholds ('
                            'sku TEXT PRIMARY KEY, min_available INTEGER NOT NULL '
                            'CHECK(min_available BETWEEN 0 AND 10000))')
-        except (OSError, sqlite3.Error):
+        except (OSError, sqlite3.Error, StockError):
             raise OperatorError('Не удалось подготовить инструменты оператора') from None
 
     @contextmanager
