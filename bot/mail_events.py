@@ -72,7 +72,8 @@ class MailEventStore:
         """
         if (type(provider) is not str or not _PROVIDER.fullmatch(provider) or
                 type(platform) is not str or not _PLATFORM.fullmatch(platform) or
-                kind not in _KINDS or type(opaque_id) is not str or
+                type(kind) is not str or kind not in _KINDS or
+                type(opaque_id) is not str or
                 not 1 <= len(opaque_id) <= 1024 or
                 type(received_at) is not int):
             return 'invalid'
