@@ -9,6 +9,7 @@ from bot.orders import Order, OrderStore
 from bot.plugins import PluginManager
 from bot.settings import Settings
 from bot.stock import StockStore
+from bot.order_audit import AuditStore
 
 
 class TestStock(unittest.TestCase):
@@ -25,6 +26,9 @@ class TestStock(unittest.TestCase):
         self.started = datetime.now(timezone.utc)
         self.orders.record([Order('ORD11111', 'paid')])
         self.orders.record([Order('ORD11111', 'paid'), Order('ORD22222', 'paid')])
+        audit = AuditStore(self.orders.filename)
+        self.assertEqual(audit.verify('ORD11111', 100), 'verified')
+        self.assertEqual(audit.verify('ORD22222', 100), 'verified')
 
     def command(self, uid, text):
         return reply_for(
