@@ -186,6 +186,14 @@ class OrderStore:
                            'created_at INTEGER NOT NULL, delivered_at INTEGER)')
                 db.execute('CREATE INDEX IF NOT EXISTS delivery_outbox_pending '
                            'ON delivery_outbox(delivered_at, id)')
+                # Local task queue: no automatic delivery or FunPay writes.
+                db.execute('CREATE TABLE IF NOT EXISTS review_queue ('
+                           'order_id TEXT PRIMARY KEY, state TEXT NOT NULL '
+                           "CHECK(state IN ('pending','done','blocked')), "
+                           'created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, '
+                           'reviewed_by INTEGER)')
+                db.execute('CREATE INDEX IF NOT EXISTS review_queue_state '
+                           'ON review_queue(state, created_at)')
         except (OSError, sqlite3.Error) as exc:
             raise OrderMonitorError('Не удалось открыть хранилище заказов') from None
 
@@ -241,6 +249,15 @@ class OrderStore:
                                'status=excluded.status, description=excluded.description, '
                                'buyer=excluded.buyer, price=excluded.price, updated_at=excluded.updated_at',
                                (order.order_id, order.status, description, buyer, price, now))
+                    # CSS-derived paid status requires human verification.
+                    if order.status == 'paid':
+                        db.execute('INSERT OR IGNORE INTO review_queue('
+                                   'order_id,state,created_at,updated_at) '
+                                   "VALUES (?,'pending',?,?)", (order.order_id, now, now))
+                    else:
+                        db.execute("UPDATE review_queue SET state='blocked',updated_at=? "
+                                   "WHERE order_id=? AND state='pending'",
+                                   (now, order.order_id))
                     if kind:
                         for uid in recipients:
                             db.execute(
@@ -255,6 +272,63 @@ class OrderStore:
             return notifications
         except (sqlite3.Error, OSError):
             raise OrderMonitorError('Не удалось сохранить результаты мониторинга') from None
+
+    def review_counts(self):
+        """Return pending, done and blocked local task counts."""
+        try:
+            with self._connect() as db:
+                rows = db.execute('SELECT state, count(*) FROM review_queue '
+                                  'GROUP BY state').fetchall()
+            counts = dict(rows)
+            return (counts.get('pending', 0), counts.get('done', 0),
+                    counts.get('blocked', 0))
+        except (sqlite3.Error, OSError):
+            raise OrderMonitorError('Не удалось подсчитать очередь проверки') from None
+
+    def pending_reviews(self, limit=7):
+        """Candidates only: NOT confirmation of payment."""
+        if type(limit) is not int or not 1 <= limit <= 50:
+            raise ValueError('Invalid review limit')
+        try:
+            with self._connect() as db:
+                rows = db.execute(
+                    'SELECT o.id,o.status,o.description,o.buyer,o.price '
+                    'FROM review_queue AS q JOIN orders AS o ON o.id=q.order_id '
+                    "WHERE q.state='pending' "
+                    'ORDER BY q.created_at ASC, q.order_id ASC LIMIT ?', (limit,)
+                ).fetchall()
+            return [Order(*row) for row in rows]
+        except (sqlite3.Error, OSError):
+            raise OrderMonitorError('Не удалось прочитать очередь проверки') from None
+
+    def mark_reviewed(self, order_id, owner_id):
+        """Record owner's manual handling, never ship anything."""
+        if (type(order_id) is not str or not _ORDER_ID.fullmatch(order_id) or
+                type(owner_id) is not int or owner_id <= 0):
+            return 'invalid'
+        try:
+            with self._connect() as db:
+                db.execute('BEGIN IMMEDIATE')
+                row = db.execute(
+                    'SELECT q.state,o.status FROM review_queue AS q '
+                    'JOIN orders AS o ON o.id=q.order_id WHERE q.order_id=?',
+                    (order_id,)
+                ).fetchone()
+                if row is None:
+                    return 'missing'
+                state, order_status = row
+                if state == 'done':
+                    return 'done'
+                if state != 'pending' or order_status != 'paid':
+                    return 'blocked'
+                db.execute(
+                    "UPDATE review_queue SET state='done', updated_at=?, "
+                    'reviewed_by=? WHERE order_id=? AND state=?',
+                    (int(time.time()), owner_id, order_id, 'pending')
+                )
+            return 'updated'
+        except (sqlite3.Error, OSError):
+            raise OrderMonitorError('Не удалось отметить проверку заказа') from None
 
     def pending_deliveries(self, limit=30):
         """Return (event_id, recipient, kind, previous_status, Order) tuples."""

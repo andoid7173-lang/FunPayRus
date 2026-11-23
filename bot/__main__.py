@@ -73,7 +73,7 @@ def flush_deliveries(store, settings, api, limit=30):
         button = order_button(order.order_id)
         markup = {'inline_keyboard': [[button]]} if button else None
         if kind == 'paid':
-            title = '🛒 Новый оплаченный заказ'
+            title = '🛒 Возможный оплаченный заказ — проверь на FunPay'
         else:
             old = previous_status or 'неизвестно'
             title = f'🔄 Статус заказа изменился: {old} → {order.status}'

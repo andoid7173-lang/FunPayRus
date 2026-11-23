@@ -35,7 +35,8 @@ def menu(role='owner'):
          {'text': '🧭 Настройка', 'callback_data': 'm:setup'}],
     ]
     if role in ('owner', 'admin'):
-        rows.append([{'text': '📦 Заказы (тест)', 'callback_data': 'm:orders'}])
+        rows.append([{'text': '📦 Заказы (тест)', 'callback_data': 'm:orders'},
+                     {'text': '🗂 Очередь проверки', 'callback_data': 'm:queue'}])
     if role == 'owner':
         rows.append([{'text': '👥 Администраторы', 'callback_data': 'm:admins'},
                      {'text': '🧩 Плагины', 'callback_data': 'm:plugins'}])
@@ -98,10 +99,55 @@ def orders_screen(settings, orders):
             result.append(f'#{order.order_id}: {order.status} — {order.description[:65]}')
     except OrderMonitorError:
         result.append('⚠️ Не удалось прочитать историю заказов.')
+    try:
+        pending, _, _ = orders.review_counts()
+        result.append(f'Ручная проверка: {pending} в очереди; см. /queue.')
+    except OrderMonitorError:
+        result.append('Очередь проверки временно недоступна.')
     result.append('Для владельца: /orders on или /orders off.\n'
                   'Уведомления включаются отдельно в 🔔 Уведомления.\n'
                   'Никаких сообщений покупателям и автовыдачи.')
     return '\n'.join(result)[:3800]
+
+
+def review_screen(settings, orders):
+    if settings is None or orders is None:
+        return 'Очередь проверки недоступна.'
+    try:
+        pending, done, blocked = orders.review_counts()
+        items = orders.pending_reviews(limit=7)
+    except OrderMonitorError:
+        return 'Не удалось прочитать очередь. Проверь /diagnostics и журнал VPS.'
+    lines = ['🗂 Очередь ручной проверки',
+             f'Ожидают: {pending} · Отмечены: {done} · Заблокированы: {blocked}',
+             'HTML-статус FunPay НЕ подтверждает получение оплаты.']
+    if items:
+        for item in items:
+            lines.append(f'#{item.order_id} · {item.description[:65] or "Без описания"}')
+    else:
+        lines.append('Активных заявок нет.')
+    lines.extend(['', '1. Открой заказ на официальном сайте FunPay.',
+                  '2. Проверь оплату, условия заказа и отсутствие возврата.',
+                  '3. Самостоятельно выполни заказ.',
+                  '4. После исполнения: /queue done НОМЕР_ЗАКАЗА',
+                  'Команда только сохраняет отметку в SQLite.',
+                  'Сообщений или товаров покупателю бот НЕ отправляет.'])
+    return '\n'.join(lines)[:3800]
+
+
+def review_menu(settings, uid, orders):
+    rows = []
+    if settings and settings.role(uid) in ('owner', 'admin') and orders is not None:
+        try:
+            for order in orders.pending_reviews(limit=5):
+                button = order_button(order.order_id)
+                if button:
+                    rows.append([button])
+        except OrderMonitorError:
+            pass
+    rows.append([{'text': '📦 Все заказы', 'callback_data': 'm:orders'}])
+    rows.append([{'text': '🏠 Главное меню', 'callback_data': 'm:home'}])
+    return {'inline_keyboard': rows}
 
 
 def plugin_menu(plugins):
@@ -186,7 +232,8 @@ def reply_for(message, admin_id, plugins, started_at,
                 '/status — состояние\n/diagnostics — диагностика VPS\n'
                 '/notifications — центр уведомлений\n/demo — демо-режим\n'
                 '/setup — мастер настройки\n/funpay — тест соединения\n'
-                + ('/orders — мониторинг продаж (только чтение)\n' if role in ('owner', 'admin') else '')
+                + ('/orders — мониторинг продаж (только чтение)\n'
+                   '/queue — ручная проверка и учёт выполнения\n' if role in ('owner', 'admin') else '')
                 + ('/admins — управление доступом\n/plugins — плагины\n' if role == 'owner' else '')
                 + '\n⚠️ Автовыдача и отправка сообщений покупателям отключены.')
     if command == 'status':
@@ -228,6 +275,31 @@ def reply_for(message, admin_id, plugins, started_at,
                 + '\\n\\n'.join(
                     f'#{x.order_id}: {x.status} — {x.description[:70]}'
                     for x in matches))
+    if command == 'queue':
+        if role not in ('owner', 'admin'):
+            return '🔒 Очередь доступна только администраторам.'
+        parts = args.strip().split()
+        if parts:
+            if len(parts) != 2 or parts[0] != 'done':
+                return 'Используй: /queue или /queue done НОМЕР_ЗАКАЗА'
+            if role != 'owner':
+                return '🔒 Только владелец отмечает выполненные заказы.'
+            if orders is None:
+                return 'Очередь проверки не настроена.'
+            try:
+                state = orders.mark_reviewed(parts[1], uid)
+            except OrderMonitorError:
+                return 'Не удалось сохранить отметку. Проверь журнал VPS.'
+            if state == 'updated':
+                return ('✅ Заказ отмечен как обработанный ТОЛЬКО в локальной базе.\n'
+                        'Это НЕ отправка товара покупателю.\n\n'
+                        + review_screen(settings, orders))
+            if state == 'done':
+                return 'Заказ уже отмечен как обработанный; повтор не требуется.'
+            if state == 'blocked':
+                return 'Обработка заблокирована: заказ изменил статус или уже отменён.'
+            return 'Заказ не найден в очереди или номер некорректен.'
+        return review_screen(settings, orders)
     if command == 'orders':
         if role not in ('owner', 'admin'):
             return '🔒 Заказы доступны только администраторам.'
@@ -266,6 +338,8 @@ def keyboard_for_command(text, plugins, settings=None, user_id=None, owner_id=No
         return alerts_menu(settings, user_id)
     if command == '/orders':
         return orders_menu(settings, user_id, orders)
+    if command == '/queue':
+        return review_menu(settings, user_id, orders)
     if command == '/findorder' and orders and settings and settings.role(user_id) in ('owner', 'admin'):
         return {'inline_keyboard': [[b] for b in (
             order_button(o.order_id) for o in orders.find(text.partition(' ')[2])
@@ -286,7 +360,7 @@ def callback_for(callback, admin_id, plugins, started_at,
                 'm:plugins': '/plugins', 'm:diagnostics': '/diagnostics',
                 'm:setup': '/setup', 'm:demo': '/demo',
                 'm:notifications': '/notifications', 'm:admins': '/admins',
-                'm:orders': '/orders'}
+                'm:orders': '/orders', 'm:queue': '/queue'}
     if data in sections:
         command = sections[data]
         output = reply_for({**check, 'text': command}, admin_id, plugins, started_at,
