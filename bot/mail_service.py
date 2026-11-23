@@ -66,6 +66,14 @@ class MailService:
 
     def enable(self):
         with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            was_enabled = db.execute(
+                "SELECT value FROM mail_monitor_state WHERE name='enabled'"
+            ).fetchone()
+            if not was_enabled or was_enabled[0] != "1":
+                # Reconnection must NOT replay messages received while disabled.
+                db.execute("DELETE FROM mail_monitor_state WHERE name IN ('since','floor')")
+                db.execute("DELETE FROM mail_monitor_outbox WHERE sent_at IS NULL")
             db.execute("INSERT OR REPLACE INTO mail_monitor_state(name,value) "
                        "VALUES ('enabled','1')")
 
@@ -105,10 +113,16 @@ class MailService:
         if row is None:
             # A first sync starts *now*; no historical email is sent.
             with self.connect() as db:
+                db.execute("BEGIN IMMEDIATE")
                 db.execute("INSERT OR IGNORE INTO mail_monitor_state(name,value) "
                            "VALUES('since',?)", (str(now),))
+                db.execute("INSERT OR IGNORE INTO mail_monitor_state(name,value) "
+                           "VALUES('floor',?)", (str(now),))
             return "initialized"
         previous = int(row[0])
+        with self.connect() as db:
+            floor_row = db.execute("SELECT value FROM mail_monitor_state WHERE name='floor'").fetchone()
+        floor = int(floor_row[0]) if floor_row else previous
         if previous > now + 300:
             raise MailServiceError("Неверное время сервера")
         token = access_token(client_id)
@@ -121,7 +135,7 @@ class MailService:
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             for message_id, received_at, platform in entries:
-                if platform not in PLATFORMS or received_at > now + 300:
+                if platform not in PLATFORMS or received_at <= floor or received_at > now + 300:
                     continue
                 digest = self.fingerprint(message_id)
                 db.execute("INSERT OR IGNORE INTO mail_monitor_outbox("
