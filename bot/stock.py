@@ -47,6 +47,8 @@ class StockStore:
             os.chmod(self.path, 0o600)
             with db:
                 yield db
+        except sqlite3.IntegrityError:
+            raise
         except sqlite3.Error:
             raise StockError('Ошибка локального склада') from None
         finally:
