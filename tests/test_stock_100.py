@@ -47,6 +47,16 @@ class TestStock(unittest.TestCase):
         self.assertIsNone(self.stock.secret_for_local_terminal('ORD11111'))
         self.assertEqual(self.orders.review_counts(), (1, 1, 0))
 
+    def test_queue_done_cannot_bypass_reserved_stock(self):
+        self.stock.add('GAMEKEY', 'secret-value-001')
+        self.assertEqual(self.stock.reserve('ORD11111', 'GAMEKEY'), 'reserved')
+        self.assertIn('/stock issue', self.command(100, '/queue done ORD11111'))
+        self.assertEqual(self.orders.review_counts(), (2, 0, 0))
+        self.assertEqual(self.stock.reservation('ORD11111'), ('GAMEKEY', 'reserved'))
+        self.assertEqual(self.command(100, '/stock issue ORD11111'),
+                         'Выдача отмечена в локальной базе. Покупателю ничего не отправлено.')
+        self.assertEqual(self.orders.review_counts(), (1, 1, 0))
+
     def test_missing_and_refunded_not_reservable(self):
         self.assertEqual(self.stock.add('GAMEKEY', 'secret-value-001'), 'added')
         self.assertEqual(self.stock.reserve('NO_ORDER', 'GAMEKEY'), 'missing')
