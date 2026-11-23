@@ -8,6 +8,7 @@ from bot.funpay_probe import status_from_environment
 from bot.settings import SettingsError
 from bot.orders import OrderMonitorError, order_button
 from bot.stock import StockError, StockStore
+from bot.order_audit import AuditStore, AuditError
 from bot.operator import OperatorError, OperatorStore
 from bot.mail_events import MailEventError, MailEventStore
 
@@ -174,6 +175,8 @@ def stock_screen(orders):
     lines.extend(['', '/stock reserve ID SKU — зарезервировать код после ручной проверки оплаты',
                   '/stock issue ID — отметить самостоятельную выдачу покупателю',
                   '/stock void ID — окончательно списать резерв',
+                  '/verify ID — отметить проверку оплаты на FunPay',
+                  '/audit ID — последние события заказа без секретов',
                   'Код товара бот никогда не показывает в Telegram.',
                   'SSH: sudo -u funpayrus python3 -m bot.stock_cli add SKU'])
     return '\n'.join(lines)[:3800]
@@ -327,6 +330,8 @@ def reply_for(message, admin_id, plugins, started_at,
                 + ('/orders — мониторинг продаж (только чтение)\n'
                    '/queue — ручная проверка и учёт выполнения\n' if role in ('owner', 'admin') else '')
                 + ('/stock — склад и резервирование кодов\n'
+                   '/verify — ручная проверка оплаты\n'
+                   '/audit — журнал действий\n'
                    '/stats — сводка локальных наблюдений\n'
                    '/lowstock — контроль остатков\n'
                    '/platforms — центр платформ\n'
@@ -418,6 +423,46 @@ def reply_for(message, admin_id, plugins, started_at,
                             'invalid': 'Неверный номер заказа или текст заметки.'}[outcome]
             except OperatorError:
                 return 'Ошибка сохранения заметки.'
+    if command in ('verify', 'audit'):
+        if role != 'owner':
+            return '🔒 Только владелец подтверждает оплату и читает аудит.'
+        if orders is None:
+            return 'Хранилище заказов недоступно.'
+        parts = args.strip().split()
+        if len(parts) != 1:
+            return ('Используй: /verify НОМЕР_ЗАКАЗА'
+                    if command == 'verify' else 'Используй: /audit НОМЕР_ЗАКАЗА')
+        try:
+            audit = AuditStore(orders.filename)
+            if command == 'verify':
+                outcome = audit.verify(parts[0], uid)
+                return {
+                    'verified': 'Проверка зафиксирована. Это твоё ручное подтверждение, '
+                                'а не независимое доказательство оплаты. '
+                                'Теперь можно /stock reserve ID SKU.',
+                    'already': 'Этот заказ уже отмечен проверенным.',
+                    'blocked': 'Заказ не ожидает проверку или статус изменился.',
+                    'missing': 'Заказ не найден в очереди.',
+                    'invalid': 'Некорректный номер заказа.'
+                }[outcome]
+            history = audit.history(parts[0])
+            if not history:
+                return 'Событий по заказу нет.'
+            names = {
+                'verified': 'Ручная проверка',
+                'verification_revoked': 'Проверка отозвана: смена статуса',
+                'reserved': 'Резервирование товара',
+                'issued': 'Отметка ручной выдачи',
+                'void': 'Резерв списан',
+                'manual_done': 'Отметка завершения без склада',
+            }
+            result = ['Журнал заказа #' + parts[0], 'Без цифровых кодов и личных данных:']
+            for action, actor, timestamp in history:
+                result.append(str(timestamp) + ': ' + names.get(action, 'Событие') +
+                              ((' · оператор ' + str(actor)) if actor else ''))
+            return '\n'.join(result)[:3700]
+        except AuditError:
+            return 'Не удалось прочитать журнал действий. Проверь базу на VPS.'
     if command == 'stock':
         if role != 'owner':
             return '🔒 Только владелец управляет складом.'
@@ -438,6 +483,7 @@ def reply_for(message, admin_id, plugins, started_at,
                     'conflict': 'Заказ уже связан с другим SKU.',
                     'missing': 'Нет заказа в очереди проверки.',
                     'blocked': 'Заказ заблокирован или не имеет статуса paid.',
+                    'unverified': 'Сначала проверь оплату на FunPay и отметь /verify ID.',
                     'empty': 'На складе нет доступных кодов для этого SKU.',
                     'invalid': 'Некорректный номер заказа или SKU.'
                 }

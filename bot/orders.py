@@ -16,6 +16,7 @@ import time
 from urllib import request, error
 
 from bot.funpay_probe import _KEY, _NoRedirect
+from bot.order_audit import create_schema, append_action
 
 ORDERS_URL = 'https://funpay.com/orders/trade'
 _MAX_BYTES = 2 * 1024 * 1024
@@ -194,6 +195,7 @@ class OrderStore:
                            'reviewed_by INTEGER)')
                 db.execute('CREATE INDEX IF NOT EXISTS review_queue_state '
                            'ON review_queue(state, created_at)')
+                create_schema(db)
         except (OSError, sqlite3.Error) as exc:
             raise OrderMonitorError('Не удалось открыть хранилище заказов') from None
 
@@ -258,6 +260,14 @@ class OrderStore:
                         db.execute("UPDATE review_queue SET state='blocked',updated_at=? "
                                    "WHERE order_id=? AND state='pending'",
                                    (now, order.order_id))
+                        # An untrusted HTML state change conservatively revokes
+                        # authorization to reserve, without returning codes to stock.
+                        removed = db.execute(
+                            'DELETE FROM manual_verifications WHERE order_id=?',
+                            (order.order_id,)
+                        ).rowcount
+                        if removed:
+                            append_action(db, order.order_id, 'verification_revoked')
                     if kind:
                         for uid in recipients:
                             db.execute(
@@ -334,6 +344,7 @@ class OrderStore:
                     'reviewed_by=? WHERE order_id=? AND state=?',
                     (int(time.time()), owner_id, order_id, 'pending')
                 )
+                append_action(db, order_id, 'manual_done', owner_id)
             return 'updated'
         except (sqlite3.Error, OSError):
             raise OrderMonitorError('Не удалось отметить проверку заказа') from None
