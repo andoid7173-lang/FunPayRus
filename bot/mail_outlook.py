@@ -58,10 +58,13 @@ def safe_graph_url(url):
     """Only the fixed HTTPS Graph inbox messages endpoint incl. nextLink."""
     if type(url) is not str or len(url) > 4096:
         return False
-    p = urlparse(url)
-    return (p.scheme == "https" and p.hostname == "graph.microsoft.com"
-            and p.port in (None, 443) and not p.username and not p.password
-            and p.path == GRAPH_PATH and not p.fragment)
+    try:
+        p = urlparse(url)
+        return (p.scheme == "https" and p.hostname == "graph.microsoft.com"
+                and p.port in (None, 443) and not p.username and not p.password
+                and p.path == GRAPH_PATH and not p.fragment)
+    except ValueError:
+        return False
 
 
 def _default_get(url, token):
